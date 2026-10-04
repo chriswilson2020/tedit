@@ -97,6 +97,7 @@ enum {
     ACT_OPEN,
     ACT_SAVE,
     ACT_SAVE_AS,
+    ACT_CLOSE_BUFFER,
     ACT_QUIT,
     ACT_UNDO,
     ACT_REDO,
@@ -109,6 +110,20 @@ enum {
     ACT_INDENT,
     ACT_UNINDENT,
     ACT_COMMENT,
+    ACT_DUP_LINE,
+    ACT_DELETE_LINE,
+    ACT_MOVE_LINE_UP,
+    ACT_MOVE_LINE_DOWN,
+    ACT_JOIN_LINE,
+    ACT_TRIM_WS,
+    ACT_UPPERCASE,
+    ACT_LOWERCASE,
+    ACT_SELECT_WORD,
+    ACT_SELECT_LINE,
+    ACT_SELECT_ALL,
+    ACT_MATCH_BRACKET,
+    ACT_BOOKMARK_TOGGLE,
+    ACT_BOOKMARK_NEXT,
     ACT_FIND,
     ACT_REPLACE,
     ACT_GOTO,
@@ -134,6 +149,7 @@ typedef struct {
 static Buffer buffers[MAX_BUFFERS];
 static int buffer_count = 1;
 static int curbuf = 0;
+static unsigned char bookmarks[MAX_BUFFERS][MAX_LINES];
 
 #define lines    (buffers[curbuf].linev)
 #define nlines   (buffers[curbuf].line_count)
@@ -174,6 +190,7 @@ static const MenuItem file_menu[] = {
     {"Open...        ^O", ACT_OPEN},
     {"Save           ^S", ACT_SAVE},
     {"Save As...     ^A", ACT_SAVE_AS},
+    {"Close buffer", ACT_CLOSE_BUFFER},
     {"----------------", ACT_NONE},
     {"Quit           ^Q", ACT_QUIT}
 };
@@ -191,13 +208,28 @@ static const MenuItem edit_menu[] = {
     {"Next word      ^D", ACT_WORD_NEXT},
     {"Indent block", ACT_INDENT},
     {"Unindent block", ACT_UNINDENT},
-    {"Comment toggle", ACT_COMMENT}
+    {"Comment toggle", ACT_COMMENT},
+    {"----------------", ACT_NONE},
+    {"Duplicate line", ACT_DUP_LINE},
+    {"Delete line", ACT_DELETE_LINE},
+    {"Move line up", ACT_MOVE_LINE_UP},
+    {"Move line down", ACT_MOVE_LINE_DOWN},
+    {"Join with next", ACT_JOIN_LINE},
+    {"Trim trailing WS", ACT_TRIM_WS},
+    {"Uppercase", ACT_UPPERCASE},
+    {"Lowercase", ACT_LOWERCASE},
+    {"Select word", ACT_SELECT_WORD},
+    {"Select line", ACT_SELECT_LINE},
+    {"Select all", ACT_SELECT_ALL}
 };
 
 static const MenuItem search_menu[] = {
     {"Find...        ^F", ACT_FIND},
     {"Replace...     ^H", ACT_REPLACE},
-    {"Goto line...   ^L", ACT_GOTO}
+    {"Goto line...   ^L", ACT_GOTO},
+    {"Matching bracket", ACT_MATCH_BRACKET},
+    {"Toggle bookmark", ACT_BOOKMARK_TOGGLE},
+    {"Next bookmark", ACT_BOOKMARK_NEXT}
 };
 
 static const MenuItem options_menu[] = {
@@ -234,6 +266,7 @@ static void set_status(const char *s)
 }
 
 static void clear_stack(Snapshot *stack, int *count);
+static int confirm_yes_no(const char *message);
 
 static void init_buffer(void)
 {
@@ -248,6 +281,7 @@ static void init_buffer(void)
     rowoff = coloff = 0;
     modified = 0;
     filename[0] = '\0';
+    memset(bookmarks[curbuf], 0, MAX_LINES);
 }
 
 static void free_buffer_index(int index)
@@ -312,6 +346,48 @@ static void switch_buffer(int dir)
     sprintf(statusmsg, "Buffer %d/%d: %s",
             curbuf + 1, buffer_count,
             filename[0] ? filename : "[No Name]");
+}
+
+
+static void close_current_buffer(void)
+{
+    int i;
+
+    if (modified) {
+        char msg[STATUS_LEN];
+
+        sprintf(msg, "Buffer %s has unsaved changes. Close without saving? (y/N)",
+                filename[0] ? filename : "[No Name]");
+
+        if (!confirm_yes_no(msg)) {
+            set_status("Close cancelled");
+            return;
+        }
+    }
+
+    free_buffer_index(curbuf);
+
+    if (buffer_count == 1) {
+        init_buffer();
+        reset_edit_history();
+        set_status("New empty buffer");
+        return;
+    }
+
+    for (i = curbuf; i < buffer_count - 1; i++) {
+        buffers[i] = buffers[i + 1];
+        memcpy(bookmarks[i], bookmarks[i + 1], MAX_LINES);
+    }
+
+    memset(&buffers[buffer_count - 1], 0, sizeof(Buffer));
+    memset(bookmarks[buffer_count - 1], 0, MAX_LINES);
+    buffer_count--;
+
+    if (curbuf >= buffer_count)
+        curbuf = buffer_count - 1;
+
+    reset_edit_history();
+    sprintf(statusmsg, "Closed buffer; now %d/%d", curbuf + 1, buffer_count);
 }
 
 
@@ -1466,6 +1542,306 @@ static void insert_typed_char(int ch)
     insert_char(ch);
 }
 
+
+static void duplicate_line(void)
+{
+    int i;
+
+    if (nlines >= MAX_LINES) {
+        set_status("Maximum line count reached");
+        return;
+    }
+
+    push_undo();
+
+    for (i = nlines; i > cy + 1; i--)
+        lines[i] = lines[i - 1];
+
+    lines[cy + 1] = dupstr(lines[cy]);
+    if (lines[cy + 1] == NULL) {
+        for (i = cy + 1; i < nlines; i++)
+            lines[i] = lines[i + 1];
+        set_status("Out of memory");
+        return;
+    }
+
+    nlines++;
+    cy++;
+    modified = 1;
+    set_status("Line duplicated");
+}
+
+static void delete_current_line(void)
+{
+    int i;
+
+    push_undo();
+
+    if (nlines == 1) {
+        free(lines[0]);
+        lines[0] = dupstr("");
+        cx = 0;
+        modified = 1;
+        set_status("Line cleared");
+        return;
+    }
+
+    free(lines[cy]);
+
+    for (i = cy; i < nlines - 1; i++)
+        lines[i] = lines[i + 1];
+
+    lines[nlines - 1] = NULL;
+    nlines--;
+
+    if (cy >= nlines)
+        cy = nlines - 1;
+    if (cx > (int)strlen(lines[cy]))
+        cx = (int)strlen(lines[cy]);
+
+    modified = 1;
+    set_status("Line deleted");
+}
+
+static void move_current_line(int dir)
+{
+    char *tmp;
+    int target;
+
+    target = cy + dir;
+
+    if (target < 0 || target >= nlines) {
+        set_status("Cannot move line further");
+        return;
+    }
+
+    push_undo();
+
+    tmp = lines[cy];
+    lines[cy] = lines[target];
+    lines[target] = tmp;
+    cy = target;
+
+    modified = 1;
+    set_status(dir < 0 ? "Line moved up" : "Line moved down");
+}
+
+static void join_with_next_line(void)
+{
+    char *joined;
+    int len1;
+    int len2;
+    int i;
+
+    if (cy >= nlines - 1) {
+        set_status("No next line");
+        return;
+    }
+
+    len1 = (int)strlen(lines[cy]);
+    len2 = (int)strlen(lines[cy + 1]);
+
+    if (len1 + len2 + 1 >= MAX_LINE) {
+        set_status("Joined line would be too long");
+        return;
+    }
+
+    push_undo();
+
+    joined = (char *)malloc(len1 + len2 + 2);
+    if (joined == NULL) {
+        set_status("Out of memory");
+        return;
+    }
+
+    strcpy(joined, lines[cy]);
+    if (len1 > 0 && len2 > 0 &&
+        !isspace((unsigned char)joined[len1 - 1]) &&
+        !isspace((unsigned char)lines[cy + 1][0]))
+        strcat(joined, " ");
+    strcat(joined, lines[cy + 1]);
+
+    free(lines[cy]);
+    free(lines[cy + 1]);
+    lines[cy] = joined;
+
+    for (i = cy + 1; i < nlines - 1; i++)
+        lines[i] = lines[i + 1];
+
+    lines[nlines - 1] = NULL;
+    nlines--;
+    cx = len1;
+    modified = 1;
+    set_status("Lines joined");
+}
+
+static void trim_trailing_whitespace(void)
+{
+    int start;
+    int end;
+    int row;
+    int changed;
+
+    selected_line_range(&start, &end);
+    push_undo();
+    changed = 0;
+
+    for (row = start; row <= end; row++) {
+        int len;
+
+        len = (int)strlen(lines[row]);
+
+        while (len > 0 &&
+              (lines[row][len - 1] == ' ' || lines[row][len - 1] == '\t')) {
+            lines[row][--len] = '\0';
+            changed = 1;
+        }
+    }
+
+    if (changed) {
+        modified = 1;
+        set_status("Trailing whitespace removed");
+    } else {
+        set_status("No trailing whitespace");
+    }
+}
+
+static void transform_case(int upper)
+{
+    int sy, sx, ey, ex;
+    int row;
+
+    normalize_selection(&sy, &sx, &ey, &ex);
+    push_undo();
+
+    for (row = sy; row <= ey; row++) {
+        int start;
+        int end;
+        int i;
+
+        start = (row == sy) ? sx : 0;
+        end = (row == ey) ? ex : (int)strlen(lines[row]);
+
+        if (!selecting) {
+            start = 0;
+            end = (int)strlen(lines[row]);
+        }
+
+        for (i = start; i < end; i++) {
+            unsigned char ch;
+
+            ch = (unsigned char)lines[row][i];
+            lines[row][i] = (char)(upper ? toupper(ch) : tolower(ch));
+        }
+    }
+
+    modified = 1;
+    set_status(upper ? "Uppercase" : "Lowercase");
+}
+
+static void select_current_word(void)
+{
+    int len;
+    int start;
+    int end;
+
+    len = (int)strlen(lines[cy]);
+    start = cx;
+    end = cx;
+
+    if (start == len && start > 0)
+        start--;
+
+    while (start > 0 &&
+          (isalnum((unsigned char)lines[cy][start - 1]) ||
+           lines[cy][start - 1] == '_'))
+        start--;
+
+    end = cx;
+    while (end < len &&
+          (isalnum((unsigned char)lines[cy][end]) ||
+           lines[cy][end] == '_'))
+        end++;
+
+    if (end <= start) {
+        set_status("No word at cursor");
+        return;
+    }
+
+    selecting = 1;
+    sel_sy = cy;
+    sel_sx = start;
+    cx = end;
+    set_status("Word selected");
+}
+
+static void select_current_line(void)
+{
+    selecting = 1;
+    sel_sy = cy;
+    sel_sx = 0;
+    cx = (int)strlen(lines[cy]);
+    set_status("Line selected");
+}
+
+static void select_all_text(void)
+{
+    selecting = 1;
+    sel_sy = 0;
+    sel_sx = 0;
+    cy = nlines - 1;
+    cx = (int)strlen(lines[cy]);
+    set_status("All selected");
+}
+
+static void goto_matching_bracket(void)
+{
+    compute_bracket_match();
+
+    if (bracket_match_row < 0) {
+        set_status("No matching bracket");
+        return;
+    }
+
+    cy = bracket_match_row;
+    cx = bracket_match_col;
+    scroll_screen();
+    set_status("Matching bracket");
+}
+
+static void toggle_bookmark(void)
+{
+    bookmarks[curbuf][cy] = bookmarks[curbuf][cy] ? 0 : 1;
+    set_status(bookmarks[curbuf][cy] ? "Bookmark set" : "Bookmark cleared");
+}
+
+static void next_bookmark(void)
+{
+    int i;
+
+    for (i = cy + 1; i < nlines; i++) {
+        if (bookmarks[curbuf][i]) {
+            cy = i;
+            cx = 0;
+            scroll_screen();
+            set_status("Next bookmark");
+            return;
+        }
+    }
+
+    for (i = 0; i <= cy; i++) {
+        if (bookmarks[curbuf][i]) {
+            cy = i;
+            cx = 0;
+            scroll_screen();
+            set_status("Next bookmark");
+            return;
+        }
+    }
+
+    set_status("No bookmarks");
+}
+
 static void scroll_screen(void)
 {
     int gutter;
@@ -1816,6 +2192,36 @@ static void draw_screen(void)
         attron(A_REVERSE);
 
     mvaddstr(0, 0, " File  Edit  Search  Options  Help ");
+    {
+        int bx;
+        int bi;
+
+        bx = 35;
+
+        for (bi = 0; bi < buffer_count && bx < COLS - 4; bi++) {
+            const char *bn;
+            const char *slash;
+            char tab[64];
+
+            bn = buffers[bi].fname[0] ? buffers[bi].fname : "[No Name]";
+            slash = strrchr(bn, '/');
+            if (slash != NULL)
+                bn = slash + 1;
+
+            sprintf(tab, "%c%d:%.*s%s%c",
+                    bi == curbuf ? '[' : ' ',
+                    bi + 1,
+                    18,
+                    bn,
+                    buffers[bi].dirty ? "*" : "",
+                    bi == curbuf ? ']' : ' ');
+
+            if (bx + (int)strlen(tab) < COLS - 1)
+                mvaddstr(0, bx, tab);
+
+            bx += (int)strlen(tab) + 1;
+        }
+    }
     clrtoeol();
 
     if (use_color)
@@ -2584,7 +2990,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v6.0");
+    mvaddstr(2, 4, "TEDIT v7.0-dev");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -2689,6 +3095,7 @@ static void execute_action(int action)
     case ACT_OPEN: do_open(); break;
     case ACT_SAVE: do_save(); break;
     case ACT_SAVE_AS: do_save_as(); break;
+    case ACT_CLOSE_BUFFER: close_current_buffer(); break;
     case ACT_QUIT: quit_editor(); break;
     case ACT_UNDO: do_undo(); break;
     case ACT_REDO: do_redo(); break;
@@ -2709,6 +3116,20 @@ static void execute_action(int action)
     case ACT_INDENT: indent_block(); break;
     case ACT_UNINDENT: unindent_block(); break;
     case ACT_COMMENT: toggle_comment_block(); break;
+    case ACT_DUP_LINE: duplicate_line(); break;
+    case ACT_DELETE_LINE: delete_current_line(); break;
+    case ACT_MOVE_LINE_UP: move_current_line(-1); break;
+    case ACT_MOVE_LINE_DOWN: move_current_line(1); break;
+    case ACT_JOIN_LINE: join_with_next_line(); break;
+    case ACT_TRIM_WS: trim_trailing_whitespace(); break;
+    case ACT_UPPERCASE: transform_case(1); break;
+    case ACT_LOWERCASE: transform_case(0); break;
+    case ACT_SELECT_WORD: select_current_word(); break;
+    case ACT_SELECT_LINE: select_current_line(); break;
+    case ACT_SELECT_ALL: select_all_text(); break;
+    case ACT_MATCH_BRACKET: goto_matching_bracket(); break;
+    case ACT_BOOKMARK_TOGGLE: toggle_bookmark(); break;
+    case ACT_BOOKMARK_NEXT: next_bookmark(); break;
     case ACT_FIND: do_find(); break;
     case ACT_REPLACE: do_replace(); break;
     case ACT_GOTO: do_goto(); break;
