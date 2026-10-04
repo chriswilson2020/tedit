@@ -41,6 +41,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <curses.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_LINES   20000
 #define MAX_LINE    8192
@@ -49,6 +52,9 @@
 #define SEARCH_LEN  256
 #define CLIP_LEN    65536
 #define UNDO_DEPTH  64
+#define BROWSER_MAX  512
+#define PATH_LEN     2048
+#define MAX_BUFFERS  8
 
 #define CTRL_KEY(x) ((x) & 0x1f)
 
@@ -66,10 +72,10 @@
 #define CP_MATCH    12
 
 typedef struct {
-    char **lines;
-    int nlines;
-    int cy, cx;
-    int rowoff, coloff;
+    char **snap_lines;
+    int snap_nlines;
+    int snap_cy, snap_cx;
+    int snap_rowoff, snap_coloff;
 } Snapshot;
 
 typedef struct {
@@ -79,6 +85,9 @@ typedef struct {
 
 enum {
     ACT_NONE = 0,
+    ACT_NEW_BUFFER,
+    ACT_PREV_BUFFER,
+    ACT_NEXT_BUFFER,
     ACT_OPEN,
     ACT_SAVE,
     ACT_SAVE_AS,
@@ -89,11 +98,17 @@ enum {
     ACT_COPY,
     ACT_CUT,
     ACT_PASTE,
+    ACT_WORD_PREV,
+    ACT_WORD_NEXT,
+    ACT_INDENT,
+    ACT_UNINDENT,
+    ACT_COMMENT,
     ACT_FIND,
     ACT_REPLACE,
     ACT_GOTO,
     ACT_TOGGLE_SYNTAX,
     ACT_TOGGLE_LINES,
+    ACT_TOGGLE_AUTOPAIRS,
     ACT_TAB2,
     ACT_TAB4,
     ACT_TAB8,
@@ -101,22 +116,47 @@ enum {
     ACT_ABOUT
 };
 
-static char *lines[MAX_LINES];
-static int nlines = 1;
-static int cy = 0, cx = 0;
-static int rowoff = 0, coloff = 0;
-static int modified = 0;
-static int quit_armed = 0;
+typedef struct {
+    char *linev[MAX_LINES];
+    int line_count;
+    int cursor_y, cursor_x;
+    int row_offset, col_offset;
+    int dirty;
+    char fname[NAME_LEN];
+} Buffer;
+
+static Buffer buffers[MAX_BUFFERS];
+static int buffer_count = 1;
+static int curbuf = 0;
+
+#define lines    (buffers[curbuf].linev)
+#define nlines   (buffers[curbuf].line_count)
+#define cy       (buffers[curbuf].cursor_y)
+#define cx       (buffers[curbuf].cursor_x)
+#define rowoff   (buffers[curbuf].row_offset)
+#define coloff   (buffers[curbuf].col_offset)
+#define modified (buffers[curbuf].dirty)
+#define filename (buffers[curbuf].fname)
+
 static int tab_width = 4;
 static int use_color = 0;
 static int ansi_color_fallback = 0;
+static int autopairs = 0;
+
+enum {
+    SYN_TEXT = 0,
+    SYN_C,
+    SYN_SHELL,
+    SYN_PYTHON,
+    SYN_MAKE,
+    SYN_PERL
+};
 static int syntax_enabled = 1;
 static int line_numbers = 1;
 
 static int selecting = 0;
 static int sel_sy = 0, sel_sx = 0;
 
-static char filename[NAME_LEN];
 static char statusmsg[STATUS_LEN];
 static char last_search[SEARCH_LEN];
 
@@ -138,6 +178,10 @@ static const char *c_keywords[] = {
 };
 
 static const MenuItem file_menu[] = {
+    {"New buffer     ^N", ACT_NEW_BUFFER},
+    {"Previous buf   ^P", ACT_PREV_BUFFER},
+    {"Next buffer    ^E", ACT_NEXT_BUFFER},
+    {"----------------", ACT_NONE},
     {"Open...        ^O", ACT_OPEN},
     {"Save           ^S", ACT_SAVE},
     {"Save As...     ^A", ACT_SAVE_AS},
@@ -152,7 +196,13 @@ static const MenuItem edit_menu[] = {
     {"Select         ^B", ACT_SELECT},
     {"Copy           ^C", ACT_COPY},
     {"Cut            ^X", ACT_CUT},
-    {"Paste          ^V", ACT_PASTE}
+    {"Paste          ^V", ACT_PASTE},
+    {"----------------", ACT_NONE},
+    {"Previous word  ^U", ACT_WORD_PREV},
+    {"Next word      ^D", ACT_WORD_NEXT},
+    {"Indent block", ACT_INDENT},
+    {"Unindent block", ACT_UNINDENT},
+    {"Comment toggle", ACT_COMMENT}
 };
 
 static const MenuItem search_menu[] = {
@@ -164,6 +214,7 @@ static const MenuItem search_menu[] = {
 static const MenuItem options_menu[] = {
     {"Toggle syntax", ACT_TOGGLE_SYNTAX},
     {"Toggle line numbers", ACT_TOGGLE_LINES},
+    {"Toggle auto-pairs", ACT_TOGGLE_AUTOPAIRS},
     {"Tab width: 2", ACT_TAB2},
     {"Tab width: 4", ACT_TAB4},
     {"Tab width: 8", ACT_TAB8}
@@ -193,60 +244,123 @@ static void set_status(const char *s)
     statusmsg[STATUS_LEN - 1] = '\0';
 }
 
+static void clear_stack(Snapshot *stack, int *count);
+
 static void init_buffer(void)
 {
     int i;
+
     for (i = 0; i < MAX_LINES; i++)
         lines[i] = NULL;
+
     lines[0] = dupstr("");
     nlines = 1;
+    cy = cx = 0;
+    rowoff = coloff = 0;
+    modified = 0;
+    filename[0] = '\0';
+}
+
+static void free_buffer_index(int index)
+{
+    int i;
+    Buffer *b;
+
+    b = &buffers[index];
+
+    for (i = 0; i < b->line_count; i++) {
+        if (b->linev[i] != NULL)
+            free(b->linev[i]);
+        b->linev[i] = NULL;
+    }
+
+    b->line_count = 0;
 }
 
 static void free_buffer(void)
 {
-    int i;
-    for (i = 0; i < nlines; i++) {
-        if (lines[i] != NULL)
-            free(lines[i]);
-        lines[i] = NULL;
-    }
+    free_buffer_index(curbuf);
 }
+
+static void reset_edit_history(void)
+{
+    clear_stack(undo_stack, &undo_count);
+    clear_stack(redo_stack, &redo_count);
+    selecting = 0;
+}
+
+static int create_new_buffer(void)
+{
+    if (buffer_count >= MAX_BUFFERS) {
+        set_status("Maximum 8 buffers");
+        return 0;
+    }
+
+    curbuf = buffer_count;
+    buffer_count++;
+    init_buffer();
+    reset_edit_history();
+    set_status("New buffer");
+    return 1;
+}
+
+static void switch_buffer(int dir)
+{
+    if (buffer_count <= 1) {
+        set_status("Only one buffer");
+        return;
+    }
+
+    curbuf += dir;
+
+    if (curbuf < 0)
+        curbuf = buffer_count - 1;
+    if (curbuf >= buffer_count)
+        curbuf = 0;
+
+    reset_edit_history();
+
+    sprintf(statusmsg, "Buffer %d/%d: %s",
+            curbuf + 1, buffer_count,
+            filename[0] ? filename : "[No Name]");
+}
+
 
 static void free_snapshot(Snapshot *s)
 {
     int i;
-    if (s->lines != NULL) {
-        for (i = 0; i < s->nlines; i++)
-            if (s->lines[i] != NULL)
-                free(s->lines[i]);
-        free(s->lines);
+    if (s->snap_lines != NULL) {
+        for (i = 0; i < s->snap_nlines; i++)
+            if (s->snap_lines[i] != NULL)
+                free(s->snap_lines[i]);
+        free(s->snap_lines);
     }
-    s->lines = NULL;
-    s->nlines = 0;
+    s->snap_lines = NULL;
+    s->snap_nlines = 0;
 }
 
 static int make_snapshot(Snapshot *s)
 {
     int i;
 
-    s->lines = (char **)malloc(sizeof(char *) * nlines);
-    if (s->lines == NULL)
+    s->snap_lines = (char **)malloc(sizeof(char *) * nlines);
+    if (s->snap_lines == NULL)
         return -1;
 
-    s->nlines = nlines;
-    s->cy = cy;
-    s->cx = cx;
-    s->rowoff = rowoff;
-    s->coloff = coloff;
+    s->snap_nlines = nlines;
+    s->snap_cy = cy;
+    s->snap_cx = cx;
+    s->snap_rowoff = rowoff;
+    s->snap_coloff = coloff;
 
     for (i = 0; i < nlines; i++) {
-        s->lines[i] = dupstr(lines[i]);
-        if (s->lines[i] == NULL) {
+        s->snap_lines[i] = dupstr(lines[i]);
+        if (s->snap_lines[i] == NULL) {
             int j;
             for (j = 0; j < i; j++)
-                free(s->lines[j]);
-            free(s->lines);
-            s->lines = NULL;
+                free(s->snap_lines[j]);
+            free(s->snap_lines);
+            s->snap_lines = NULL;
             return -1;
         }
     }
@@ -260,14 +374,14 @@ static void restore_snapshot(const Snapshot *s)
 
     free_buffer();
 
-    nlines = s->nlines;
+    nlines = s->snap_nlines;
     for (i = 0; i < nlines; i++)
-        lines[i] = dupstr(s->lines[i]);
+        lines[i] = dupstr(s->snap_lines[i]);
 
-    cy = s->cy;
-    cx = s->cx;
-    rowoff = s->rowoff;
-    coloff = s->coloff;
+    cy = s->snap_cy;
+    cx = s->snap_cx;
+    rowoff = s->snap_rowoff;
+    coloff = s->snap_coloff;
     modified = 1;
     selecting = 0;
 }
@@ -349,20 +463,121 @@ static void do_redo(void)
     set_status("Redo");
 }
 
-static int is_c_file(void)
+
+static int ends_with(const char *s, const char *suffix)
+{
+    int ls;
+    int lx;
+
+    ls = (int)strlen(s);
+    lx = (int)strlen(suffix);
+
+    if (lx > ls)
+        return 0;
+
+    return strcmp(s + ls - lx, suffix) == 0;
+}
+
+static const char *base_name(const char *s)
 {
     const char *p;
+    p = strrchr(s, '/');
+    return p == NULL ? s : p + 1;
+}
 
-    if (filename[0] == '\0')
-        return 0;
+static int syntax_mode(void)
+{
+    const char *b;
 
-    p = strrchr(filename, '.');
-    if (p == NULL)
-        return 0;
+    if (!syntax_enabled || filename[0] == '\0')
+        return SYN_TEXT;
 
-    return !strcmp(p, ".c")   || !strcmp(p, ".h")   ||
-           !strcmp(p, ".cc")  || !strcmp(p, ".hh")  ||
-           !strcmp(p, ".cpp") || !strcmp(p, ".hpp");
+    b = base_name(filename);
+
+    if (!strcmp(b, "Makefile") || !strcmp(b, "makefile") ||
+        ends_with(b, ".mk"))
+        return SYN_MAKE;
+
+    if (ends_with(b, ".c") || ends_with(b, ".h") ||
+        ends_with(b, ".cc") || ends_with(b, ".hh") ||
+        ends_with(b, ".cpp") || ends_with(b, ".hpp"))
+        return SYN_C;
+
+    if (ends_with(b, ".sh") || ends_with(b, ".bash") ||
+        ends_with(b, ".ksh") || ends_with(b, ".csh"))
+        return SYN_SHELL;
+
+    if (ends_with(b, ".py"))
+        return SYN_PYTHON;
+
+    if (ends_with(b, ".pl") || ends_with(b, ".pm"))
+        return SYN_PERL;
+
+    return SYN_TEXT;
+}
+
+static const char *syntax_name(void)
+{
+    switch (syntax_mode()) {
+    case SYN_C:      return "C/C++";
+    case SYN_SHELL:  return "SH";
+    case SYN_PYTHON: return "PY";
+    case SYN_MAKE:   return "MAKE";
+    case SYN_PERL:   return "PERL";
+    default:         return "TEXT";
+    }
+}
+
+static void load_config(void)
+{
+    char path[NAME_LEN];
+    char buf[256];
+    char *home;
+    FILE *fp;
+
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    sprintf(path, "%s/.teditrc", home);
+
+    fp = fopen(path, "r");
+    if (fp == NULL)
+        return;
+
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        char *p;
+
+        p = strchr(buf, '\n');
+        if (p != NULL)
+            *p = '\0';
+
+        if (!strncmp(buf, "tabwidth=", 9)) {
+            int n;
+            n = atoi(buf + 9);
+            if (n == 2 || n == 4 || n == 8)
+                tab_width = n;
+        } else if (!strcmp(buf, "linenumbers=on")) {
+            line_numbers = 1;
+        } else if (!strcmp(buf, "linenumbers=off")) {
+            line_numbers = 0;
+        } else if (!strcmp(buf, "syntax=on")) {
+            syntax_enabled = 1;
+        } else if (!strcmp(buf, "syntax=off")) {
+            syntax_enabled = 0;
+        } else if (!strcmp(buf, "autopairs=on")) {
+            autopairs = 1;
+        } else if (!strcmp(buf, "autopairs=off")) {
+            autopairs = 0;
+        }
+    }
+
+    fclose(fp);
+}
+
+static int is_c_file(void)
+{
+    return syntax_mode() == SYN_C;
 }
 
 static int load_file(const char *name)
@@ -1003,6 +1218,285 @@ static void paste_text(void)
     set_status("Pasted");
 }
 
+
+static void move_word_left(void)
+{
+    if (cx == 0 && cy > 0) {
+        cy--;
+        cx = (int)strlen(lines[cy]);
+    }
+
+    while (cx > 0 &&
+           isspace((unsigned char)lines[cy][cx - 1]))
+        cx--;
+
+    while (cx > 0 &&
+          (isalnum((unsigned char)lines[cy][cx - 1]) ||
+           lines[cy][cx - 1] == '_'))
+        cx--;
+}
+
+static void move_word_right(void)
+{
+    int len;
+
+    len = (int)strlen(lines[cy]);
+
+    if (cx >= len && cy < nlines - 1) {
+        cy++;
+        cx = 0;
+        len = (int)strlen(lines[cy]);
+    }
+
+    while (cx < len &&
+           isspace((unsigned char)lines[cy][cx]))
+        cx++;
+
+    while (cx < len &&
+          (isalnum((unsigned char)lines[cy][cx]) ||
+           lines[cy][cx] == '_'))
+        cx++;
+}
+
+static void selected_line_range(int *start, int *end)
+{
+    int sy, sx, ey, ex;
+
+    if (!selecting) {
+        *start = *end = cy;
+        return;
+    }
+
+    normalize_selection(&sy, &sx, &ey, &ex);
+    *start = sy;
+    *end = ey;
+
+    if (ex == 0 && ey > sy)
+        (*end)--;
+}
+
+static void indent_block(void)
+{
+    int start, end;
+    int row;
+    int i;
+
+    selected_line_range(&start, &end);
+    push_undo();
+
+    for (row = start; row <= end; row++) {
+        char *old;
+        char *p;
+        int len;
+
+        old = lines[row];
+        len = (int)strlen(old);
+
+        if (len + tab_width >= MAX_LINE)
+            continue;
+
+        p = (char *)malloc(len + tab_width + 1);
+        if (p == NULL)
+            continue;
+
+        for (i = 0; i < tab_width; i++)
+            p[i] = ' ';
+
+        strcpy(p + tab_width, old);
+        free(old);
+        lines[row] = p;
+    }
+
+    if (cy >= start && cy <= end)
+        cx += tab_width;
+
+    if (selecting)
+        sel_sx += tab_width;
+
+    modified = 1;
+    set_status("Indented");
+}
+
+static void unindent_block(void)
+{
+    int start, end;
+    int row;
+
+    selected_line_range(&start, &end);
+    push_undo();
+
+    for (row = start; row <= end; row++) {
+        char *line;
+        int remove;
+        int len;
+
+        line = lines[row];
+        len = (int)strlen(line);
+        remove = 0;
+
+        if (line[0] == '\t') {
+            remove = 1;
+        } else {
+            while (remove < tab_width &&
+                   remove < len &&
+                   line[remove] == ' ')
+                remove++;
+        }
+
+        if (remove > 0)
+            memmove(line, line + remove, len - remove + 1);
+    }
+
+    if (cy >= start && cy <= end) {
+        if (cx >= tab_width)
+            cx -= tab_width;
+        else
+            cx = 0;
+    }
+
+    if (selecting) {
+        if (sel_sx >= tab_width)
+            sel_sx -= tab_width;
+        else
+            sel_sx = 0;
+    }
+
+    modified = 1;
+    set_status("Unindented");
+}
+
+static const char *comment_prefix(void)
+{
+    if (syntax_mode() == SYN_C)
+        return "//";
+
+    if (syntax_mode() == SYN_SHELL ||
+        syntax_mode() == SYN_PYTHON ||
+        syntax_mode() == SYN_MAKE ||
+        syntax_mode() == SYN_PERL)
+        return "#";
+
+    return "#";
+}
+
+static int line_comment_pos(const char *line)
+{
+    int i;
+    i = 0;
+    while (line[i] == ' ' || line[i] == '\t')
+        i++;
+    return i;
+}
+
+static void toggle_comment_block(void)
+{
+    int start, end;
+    int row;
+    int all_commented;
+    const char *prefix;
+    int plen;
+
+    selected_line_range(&start, &end);
+    prefix = comment_prefix();
+    plen = (int)strlen(prefix);
+    all_commented = 1;
+
+    for (row = start; row <= end; row++) {
+        int pos;
+        pos = line_comment_pos(lines[row]);
+
+        if (strncmp(lines[row] + pos, prefix, plen) != 0) {
+            all_commented = 0;
+            break;
+        }
+    }
+
+    push_undo();
+
+    for (row = start; row <= end; row++) {
+        char *line;
+        int pos;
+        int len;
+
+        line = lines[row];
+        pos = line_comment_pos(line);
+        len = (int)strlen(line);
+
+        if (all_commented) {
+            if (!strncmp(line + pos, prefix, plen))
+                memmove(line + pos, line + pos + plen,
+                        len - pos - plen + 1);
+        } else {
+            char *p;
+
+            if (len + plen >= MAX_LINE)
+                continue;
+
+            p = (char *)malloc(len + plen + 1);
+            if (p == NULL)
+                continue;
+
+            memcpy(p, line, pos);
+            memcpy(p + pos, prefix, plen);
+            strcpy(p + pos + plen, line + pos);
+
+            free(line);
+            lines[row] = p;
+        }
+    }
+
+    modified = 1;
+    set_status(all_commented ? "Uncommented" : "Commented");
+}
+
+static int pair_for(int ch)
+{
+    switch (ch) {
+    case '(': return ')';
+    case '[': return ']';
+    case '{': return '}';
+    case '"': return '"';
+    case '\'': return '\'';
+    }
+    return 0;
+}
+
+static void insert_typed_char(int ch)
+{
+    int close;
+    int len;
+
+    len = (int)strlen(lines[cy]);
+
+    if (autopairs &&
+       (ch == ')' || ch == ']' || ch == '}' || ch == '"' || ch == '\'') &&
+        cx < len && lines[cy][cx] == ch) {
+        cx++;
+        return;
+    }
+
+    close = autopairs ? pair_for(ch) : 0;
+
+    if (close != 0) {
+        push_undo();
+
+        if (ch == '}' && prefix_is_whitespace(lines[cy], cx))
+            smart_outdent_for_brace();
+
+        if (insert_char_at(cy, cx, ch) == 0) {
+            if (insert_char_at(cy, cx + 1, close) == 0) {
+                cx++;
+                modified = 1;
+                return;
+            }
+        }
+
+        return;
+    }
+
+    insert_char(ch);
+}
+
 static void scroll_screen(void)
 {
     int gutter;
@@ -1502,6 +1996,128 @@ static void ansi_overlay_c_line(int screen_y, int row,
     }
 }
 
+
+static int word_is(const char *s, int len, const char *word)
+{
+    return (int)strlen(word) == len && !strncmp(s, word, len);
+}
+
+static int generic_keyword(int mode, const char *s, int len)
+{
+    static const char *py[] = {
+        "and","as","assert","break","class","continue","def","del","elif",
+        "else","except","False","finally","for","from","global","if","import",
+        "in","is","lambda","None","nonlocal","not","or","pass","raise",
+        "return","True","try","while","with","yield",0
+    };
+    static const char *sh[] = {
+        "case","do","done","elif","else","esac","fi","for","function","if",
+        "in","select","then","time","until","while",0
+    };
+    static const char *perl[] = {
+        "my","our","local","sub","use","package","if","elsif","else","unless",
+        "while","until","for","foreach","return","last","next","redo","given",
+        "when","default",0
+    };
+    const char **list;
+    int i;
+
+    list = NULL;
+    if (mode == SYN_PYTHON)
+        list = py;
+    else if (mode == SYN_SHELL || mode == SYN_MAKE)
+        list = sh;
+    else if (mode == SYN_PERL)
+        list = perl;
+
+    if (list == NULL)
+        return 0;
+
+    for (i = 0; list[i] != 0; i++) {
+        if (word_is(s, len, list[i]))
+            return 1;
+    }
+
+    return 0;
+}
+
+static void ansi_overlay_generic_line(int screen_y, int row,
+                                      const char *s, int gutter, int mode)
+{
+    int i;
+    int len;
+    int visible_start;
+    int visible_end;
+
+    i = 0;
+    len = (int)strlen(s);
+    visible_start = coloff;
+    visible_end = coloff + (COLS - gutter - 1);
+
+    while (i < len) {
+        int start;
+        int pair;
+
+        start = i;
+        pair = CP_NORMAL;
+
+        if (s[i] == '#') {
+            pair = CP_COMMENT;
+            i = len;
+        } else if (s[i] == '"' || s[i] == '\'') {
+            int q;
+            q = s[i++];
+            pair = CP_STRING;
+            while (i < len) {
+                if (s[i] == '\\' && i + 1 < len)
+                    i += 2;
+                else if (s[i] == q) {
+                    i++;
+                    break;
+                } else {
+                    i++;
+                }
+            }
+        } else if (isdigit((unsigned char)s[i])) {
+            pair = CP_NUMBER;
+            i++;
+            while (i < len &&
+                  (isalnum((unsigned char)s[i]) ||
+                   s[i] == '.' || s[i] == 'x' || s[i] == 'X'))
+                i++;
+        } else if (isalpha((unsigned char)s[i]) || s[i] == '_') {
+            i++;
+            while (i < len &&
+                  (isalnum((unsigned char)s[i]) || s[i] == '_'))
+                i++;
+
+            if (generic_keyword(mode, s + start, i - start))
+                pair = CP_KEYWORD;
+        } else {
+            i++;
+        }
+
+        if (pair != CP_NORMAL &&
+            i > visible_start && start < visible_end) {
+            int ds;
+            int de;
+
+            ds = start < visible_start ? visible_start : start;
+            de = i > visible_end ? visible_end : i;
+
+            if (de > ds && !pos_selected(row, ds)) {
+                ansi_overlay_span(
+                    screen_y,
+                    gutter + (ds - visible_start),
+                    s + ds,
+                    de - ds,
+                    pair
+                );
+            }
+        }
+    }
+}
+
 static void ansi_overlay_syntax(void)
 {
     int y;
@@ -1509,8 +2125,21 @@ static void ansi_overlay_syntax(void)
     int textrows;
     int gutter;
     int block_comment;
+    int mode;
 
-    if (!ansi_color_fallback || !syntax_enabled || !is_c_file())
+    if (!syntax_enabled)
+        return;
+
+    mode = syntax_mode();
+    if (mode == SYN_TEXT)
+        return;
+
+    /*
+     * Use ANSI overlays for IRIX fallback.  Also use them for non-C
+     * modes even if curses colours exist, keeping the language support
+     * identical across old and modern UNIX terminals.
+     */
+    if (!ansi_color_fallback && mode == SYN_C)
         return;
 
     gutter = line_numbers ? 6 : 0;
@@ -1526,11 +2155,14 @@ static void ansi_overlay_syntax(void)
         if (filerow >= nlines)
             break;
 
-        ansi_overlay_c_line(y + 1, filerow, lines[filerow],
-                            &block_comment, gutter);
+        if (mode == SYN_C)
+            ansi_overlay_c_line(y + 1, filerow, lines[filerow],
+                                &block_comment, gutter);
+        else
+            ansi_overlay_generic_line(y + 1, filerow, lines[filerow],
+                                      gutter, mode);
     }
 
-    /* Restore default attributes and place the cursor back in the editor. */
     printf("\033[0m");
     printf("\033[%d;%dH",
            (cy - rowoff) + 2,
@@ -1641,8 +2273,7 @@ static void draw_screen(void)
 
     refresh();
 
-    if (ansi_color_fallback)
-        ansi_overlay_syntax();
+    ansi_overlay_syntax();
 }
 
 static int prompt_input(const char *prompt, char *out, int outlen)
@@ -1704,16 +2335,430 @@ static void do_save(void)
         save_file_as(filename);
 }
 
+
+typedef struct {
+    char name[NAME_LEN];
+    int isdir;
+    long size;
+    unsigned long mode;
+} BrowserEntry;
+
+static int browser_cmp(const void *a, const void *b)
+{
+    const BrowserEntry *ea;
+    const BrowserEntry *eb;
+
+    ea = (const BrowserEntry *)a;
+    eb = (const BrowserEntry *)b;
+
+    if (ea->isdir != eb->isdir)
+        return eb->isdir - ea->isdir;
+
+    return strcmp(ea->name, eb->name);
+}
+
+static void path_parent(char *path)
+{
+    int len;
+    char *p;
+
+    len = (int)strlen(path);
+
+    while (len > 1 && path[len - 1] == '/') {
+        path[len - 1] = '\0';
+        len--;
+    }
+
+    p = strrchr(path, '/');
+
+    if (p == NULL) {
+        strcpy(path, ".");
+    } else if (p == path) {
+        path[1] = '\0';
+    } else {
+        *p = '\0';
+    }
+}
+
+static void path_join(char *out, const char *dir, const char *name)
+{
+    if (!strcmp(dir, "/"))
+        sprintf(out, "/%s", name);
+    else
+        sprintf(out, "%s/%s", dir, name);
+}
+
+static int browser_load(const char *path, BrowserEntry *entries, int max_entries)
+{
+    DIR *dp;
+    struct dirent *de;
+    int count;
+
+    dp = opendir(path);
+    if (dp == NULL)
+        return -1;
+
+    count = 0;
+
+    while ((de = readdir(dp)) != NULL && count < max_entries) {
+        char full[PATH_LEN];
+        struct stat st;
+
+        if (!strcmp(de->d_name, "."))
+            continue;
+
+        strncpy(entries[count].name, de->d_name, NAME_LEN - 1);
+        entries[count].name[NAME_LEN - 1] = '\0';
+
+        path_join(full, path, de->d_name);
+
+        if (stat(full, &st) == 0) {
+            entries[count].isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+            entries[count].size = (long)st.st_size;
+            entries[count].mode = (unsigned long)st.st_mode;
+        } else {
+            entries[count].isdir = 0;
+            entries[count].size = 0;
+            entries[count].mode = 0;
+        }
+
+        count++;
+    }
+
+    closedir(dp);
+
+    qsort(entries, count, sizeof(BrowserEntry), browser_cmp);
+    return count;
+}
+
+
+static void draw_hline_ascii(int y, int x, int width)
+{
+    int i;
+
+    if (width < 2)
+        return;
+
+    mvaddch(y, x, '+');
+
+    for (i = 1; i < width - 1; i++)
+        addch('-');
+
+    addch('+');
+}
+
+static void draw_box_ascii(int y, int x, int height, int width)
+{
+    int i;
+
+    if (height < 2 || width < 2)
+        return;
+
+    draw_hline_ascii(y, x, width);
+
+    for (i = 1; i < height - 1; i++) {
+        mvaddch(y + i, x, '|');
+        mvaddch(y + i, x + width - 1, '|');
+    }
+
+    draw_hline_ascii(y + height - 1, x, width);
+}
+
+static void human_size(long bytes, char *out, int outlen)
+{
+    if (bytes < 1024L)
+        sprintf(out, "%ld B", bytes);
+    else if (bytes < 1024L * 1024L)
+        sprintf(out, "%ld KB", bytes / 1024L);
+    else
+        sprintf(out, "%ld MB", bytes / (1024L * 1024L));
+
+    out[outlen - 1] = '\0';
+}
+
+static void browser_preview_text(const char *path,
+                                 int y, int x, int height, int width)
+{
+    FILE *fp;
+    char buf[256];
+    int row;
+
+    fp = fopen(path, "r");
+
+    if (fp == NULL) {
+        mvaddnstr(y, x, "(preview unavailable)", width);
+        return;
+    }
+
+    row = 0;
+
+    while (row < height && fgets(buf, sizeof(buf), fp) != NULL) {
+        int i;
+
+        for (i = 0; buf[i] != '\0'; i++) {
+            unsigned char c;
+
+            c = (unsigned char)buf[i];
+
+            if (c == '\n' || c == '\r') {
+                buf[i] = '\0';
+                break;
+            }
+
+            if (c < 32 && c != '\t') {
+                strcpy(buf, "(binary/non-text file)");
+                row = height - 1;
+                break;
+            }
+        }
+
+        mvaddnstr(y + row, x, buf, width);
+        row++;
+    }
+
+    fclose(fp);
+}
+
+static int file_browser(char *out, int outlen)
+{
+    BrowserEntry entries[BROWSER_MAX];
+    char path[PATH_LEN];
+    char full[PATH_LEN];
+    int count;
+    int selected;
+    int top;
+    int ch;
+
+    if (getcwd(path, sizeof(path)) == NULL)
+        strcpy(path, ".");
+
+    selected = 0;
+    top = 0;
+
+    for (;;) {
+        int i;
+        int body_y;
+        int body_h;
+        int left_x;
+        int left_w;
+        int right_x;
+        int right_w;
+        int list_rows;
+
+        count = browser_load(path, entries, BROWSER_MAX);
+
+        if (count < 0) {
+            set_status("Cannot open directory");
+            return 0;
+        }
+
+        if (selected >= count)
+            selected = count > 0 ? count - 1 : 0;
+
+        body_y = 3;
+        body_h = LINES - 6;
+
+        if (body_h < 8)
+            body_h = 8;
+
+        left_x = 1;
+        left_w = (COLS * 3) / 5;
+
+        if (left_w < 28)
+            left_w = COLS - 2;
+
+        right_x = left_x + left_w;
+        right_w = COLS - right_x - 1;
+
+        if (right_w < 22) {
+            right_w = 0;
+            left_w = COLS - 2;
+        }
+
+        list_rows = body_h - 2;
+
+        if (selected < top)
+            top = selected;
+
+        if (selected >= top + list_rows)
+            top = selected - list_rows + 1;
+
+        if (top < 0)
+            top = 0;
+
+        erase();
+
+        attron(A_REVERSE);
+        mvaddstr(0, 0, " TEDIT Open File ");
+        clrtoeol();
+        attroff(A_REVERSE);
+
+        mvaddstr(1, 1, "Path: ");
+        mvaddnstr(1, 7, path, COLS - 8);
+
+        draw_box_ascii(body_y, left_x, body_h, left_w);
+
+        if (right_w > 0)
+            draw_box_ascii(body_y, right_x, body_h, right_w);
+
+        mvaddstr(body_y, left_x + 2, " Files ");
+
+        if (right_w > 0)
+            mvaddstr(body_y, right_x + 2, " Info / Preview ");
+
+        for (i = 0; i < list_rows; i++) {
+            int idx;
+            char display[NAME_LEN + 32];
+            char sizebuf[32];
+            int avail;
+
+            idx = top + i;
+
+            if (idx >= count)
+                break;
+
+            if (entries[idx].isdir) {
+                sprintf(display, "/ %-*.*s",
+                        left_w - 6, left_w - 6,
+                        entries[idx].name);
+            } else {
+                human_size(entries[idx].size, sizebuf, sizeof(sizebuf));
+                avail = left_w - 16;
+
+                if (avail < 6)
+                    avail = 6;
+
+                sprintf(display, "  %-*.*s %8s",
+                        avail, avail,
+                        entries[idx].name,
+                        sizebuf);
+            }
+
+            if (idx == selected)
+                attron(A_REVERSE);
+
+            mvaddnstr(body_y + 1 + i,
+                      left_x + 1,
+                      display,
+                      left_w - 2);
+
+            if (idx == selected)
+                attroff(A_REVERSE);
+        }
+
+        if (right_w > 0 && count > 0) {
+            int info_y;
+            char sizebuf[32];
+
+            path_join(full, path, entries[selected].name);
+            info_y = body_y + 2;
+
+            mvaddstr(info_y, right_x + 2, "Name:");
+            mvaddnstr(info_y + 1,
+                      right_x + 2,
+                      entries[selected].name,
+                      right_w - 4);
+
+            mvaddstr(info_y + 3, right_x + 2, "Type:");
+            mvaddstr(info_y + 4,
+                     right_x + 2,
+                     entries[selected].isdir ? "Directory" : "File");
+
+            if (!entries[selected].isdir) {
+                human_size(entries[selected].size, sizebuf, sizeof(sizebuf));
+
+                mvaddstr(info_y + 6, right_x + 2, "Size:");
+                mvaddstr(info_y + 7, right_x + 2, sizebuf);
+
+                if (body_h > 15) {
+                    mvaddstr(info_y + 9, right_x + 2, "Preview:");
+                    browser_preview_text(full,
+                                         info_y + 10,
+                                         right_x + 2,
+                                         body_h - 13,
+                                         right_w - 4);
+                }
+            } else {
+                mvaddstr(info_y + 6,
+                         right_x + 2,
+                         "Enter to browse");
+            }
+        }
+
+        attron(A_REVERSE);
+        mvaddstr(LINES - 2, 0,
+                 " Up/Down Move  Enter Open/Browse  Backspace Parent  Esc Cancel ");
+        clrtoeol();
+        attroff(A_REVERSE);
+
+        mvaddstr(LINES - 1, 1,
+                 "Directories are shown first. File sizes appear in the left panel.");
+
+        refresh();
+        ch = getch();
+
+        if (ch == 27)
+            return 0;
+
+        if (ch == KEY_UP) {
+            if (selected > 0)
+                selected--;
+        } else if (ch == KEY_DOWN) {
+            if (selected + 1 < count)
+                selected++;
+#ifdef KEY_PPAGE
+        } else if (ch == KEY_PPAGE) {
+            selected -= list_rows;
+
+            if (selected < 0)
+                selected = 0;
+#endif
+#ifdef KEY_NPAGE
+        } else if (ch == KEY_NPAGE) {
+            selected += list_rows;
+
+            if (selected >= count)
+                selected = count > 0 ? count - 1 : 0;
+#endif
+#ifdef KEY_HOME
+        } else if (ch == KEY_HOME) {
+            selected = 0;
+#endif
+#ifdef KEY_END
+        } else if (ch == KEY_END) {
+            selected = count > 0 ? count - 1 : 0;
+#endif
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            path_parent(path);
+            selected = 0;
+            top = 0;
+        } else if ((ch == '\n' || ch == '\r') && count > 0) {
+            path_join(full, path, entries[selected].name);
+
+            if (entries[selected].isdir) {
+                strncpy(path, full, sizeof(path) - 1);
+                path[sizeof(path) - 1] = '\0';
+                selected = 0;
+                top = 0;
+            } else {
+                strncpy(out, full, outlen - 1);
+                out[outlen - 1] = '\0';
+                return 1;
+            }
+        }
+    }
+}
+
 static void do_open(void)
 {
-    char name[NAME_LEN];
+    char name[PATH_LEN];
 
     if (modified) {
         set_status("Unsaved changes: save first");
         return;
     }
 
-    if (!prompt_input("Open file: ", name, sizeof(name)) || !name[0]) {
+    if (!file_browser(name, sizeof(name))) {
         set_status("Open cancelled");
         return;
     }
@@ -1898,25 +2943,17 @@ static void help_screen(void)
 {
     erase();
 
-    mvaddstr(1, 2, "TEDIT v4 - portable curses editor");
-    mvaddstr(3, 2, "Ctrl-T       Menu bar");
-    mvaddstr(4, 2, "Ctrl-O       Open");
-    mvaddstr(5, 2, "Ctrl-S       Save");
-    mvaddstr(6, 2, "Ctrl-A       Save As");
-    mvaddstr(7, 2, "Ctrl-F       Find");
-    mvaddstr(8, 2, "Ctrl-H       Replace");
-    mvaddstr(9, 2, "Ctrl-L       Goto line");
-    mvaddstr(10, 2, "Ctrl-Z       Undo");
-    mvaddstr(11, 2, "Ctrl-R       Redo");
-    mvaddstr(12, 2, "Ctrl-B       Start/stop selection");
-    mvaddstr(13, 2, "Ctrl-C       Copy selection/current line");
-    mvaddstr(14, 2, "Ctrl-X       Cut selection/current line");
-    mvaddstr(15, 2, "Ctrl-V       Paste");
-    mvaddstr(16, 2, "Ctrl-Q       Quit");
-    mvaddstr(18, 2, "Tab          Spaces to next tab stop");
-    mvaddstr(19, 2, "Enter        Smart-indent new line");
-    mvaddstr(20, 2, "}            Auto-outdent in leading whitespace");
-    mvaddstr(22, 2, "Press any key.");
+    mvaddstr(1, 2, "TEDIT v5 - portable curses editor");
+    mvaddstr(3, 2, "^T Menu   ^N New   ^P Prev buffer   ^E Next buffer");
+    mvaddstr(4, 2, "^O Open   ^S Save  ^A Save As       ^Q Quit");
+    mvaddstr(5, 2, "^F Find   ^H Replace   ^L Goto");
+    mvaddstr(6, 2, "^Z Undo   ^R Redo");
+    mvaddstr(7, 2, "^B Select ^C Copy      ^X Cut       ^V Paste");
+    mvaddstr(8, 2, "^U Prev word           ^D Next word");
+    mvaddstr(10,2, "Edit menu: indent/unindent block and comment toggle");
+    mvaddstr(11,2, "Options: syntax, line numbers, auto-pairs, tab width");
+    mvaddstr(13,2, "Tab/Enter/} use smart C-style indentation.");
+    mvaddstr(15,2, "Press any key.");
 
     refresh();
     getch();
@@ -1926,7 +2963,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v4");
+    mvaddstr(2, 4, "TEDIT v5.1");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -1935,12 +2972,63 @@ static void about_screen(void)
     getch();
 }
 
+
+static int unsaved_buffer_count(void)
+{
+    int i;
+    int count;
+
+    count = 0;
+
+    for (i = 0; i < buffer_count; i++) {
+        if (buffers[i].dirty)
+            count++;
+    }
+
+    return count;
+}
+
+static int confirm_yes_no(const char *message)
+{
+    int ch;
+
+    for (;;) {
+        move(LINES - 1, 0);
+        clrtoeol();
+        mvaddnstr(LINES - 1, 0, message, COLS - 1);
+        refresh();
+
+        ch = getch();
+
+        if (ch == 'y' || ch == 'Y')
+            return 1;
+
+        if (ch == 'n' || ch == 'N' ||
+            ch == 27 || ch == '\n' || ch == '\r')
+            return 0;
+    }
+}
+
 static void quit_editor(void)
 {
-    if (modified && !quit_armed) {
-        quit_armed = 1;
-        set_status("Unsaved changes. Ctrl-Q again to quit.");
-        return;
+    int dirty;
+
+    dirty = unsaved_buffer_count();
+
+    if (dirty > 0) {
+        char msg[STATUS_LEN];
+
+        if (dirty == 1)
+            sprintf(msg, "1 buffer has unsaved changes. Quit without saving? (y/N)");
+        else
+            sprintf(msg, "%d buffers have unsaved changes. Quit without saving? (y/N)",
+                    dirty);
+
+        if (!confirm_yes_no(msg)) {
+            set_status("Quit cancelled");
+            draw_screen();
+            return;
+        }
     }
 
     erase();
@@ -1950,7 +3038,12 @@ static void quit_editor(void)
     printf("\033[2J\033[H");
     fflush(stdout);
 
-    free_buffer();
+    {
+        int bi;
+        for (bi = 0; bi < buffer_count; bi++)
+            free_buffer_index(bi);
+    }
+
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
 
@@ -1963,6 +3056,15 @@ static void quit_editor(void)
 static void execute_action(int action)
 {
     switch (action) {
+    case ACT_NEW_BUFFER:
+        create_new_buffer();
+        break;
+    case ACT_PREV_BUFFER:
+        switch_buffer(-1);
+        break;
+    case ACT_NEXT_BUFFER:
+        switch_buffer(1);
+        break;
     case ACT_OPEN: do_open(); break;
     case ACT_SAVE: do_save(); break;
     case ACT_SAVE_AS: do_save_as(); break;
@@ -1981,6 +3083,11 @@ static void execute_action(int action)
     case ACT_COPY: copy_selection_or_line(); break;
     case ACT_CUT: cut_selection_or_line(); break;
     case ACT_PASTE: paste_text(); break;
+    case ACT_WORD_PREV: move_word_left(); break;
+    case ACT_WORD_NEXT: move_word_right(); break;
+    case ACT_INDENT: indent_block(); break;
+    case ACT_UNINDENT: unindent_block(); break;
+    case ACT_COMMENT: toggle_comment_block(); break;
     case ACT_FIND: do_find(); break;
     case ACT_REPLACE: do_replace(); break;
     case ACT_GOTO: do_goto(); break;
@@ -1992,6 +3099,10 @@ static void execute_action(int action)
     case ACT_TOGGLE_LINES:
         line_numbers = !line_numbers;
         set_status(line_numbers ? "Line numbers on" : "Line numbers off");
+        break;
+    case ACT_TOGGLE_AUTOPAIRS:
+        autopairs = !autopairs;
+        set_status(autopairs ? "Auto-pairs on" : "Auto-pairs off");
         break;
     case ACT_TAB2:
         tab_width = 2; set_status("Tab width 2"); break;
@@ -2182,6 +3293,33 @@ static void draw_dropdown(int menu_index, int selected_item)
     }
 }
 
+
+static int shortcut_action(int ch)
+{
+    switch (ch) {
+    case CTRL_KEY('n'): return ACT_NEW_BUFFER;
+    case CTRL_KEY('p'): return ACT_PREV_BUFFER;
+    case CTRL_KEY('e'): return ACT_NEXT_BUFFER;
+    case CTRL_KEY('o'): return ACT_OPEN;
+    case CTRL_KEY('s'): return ACT_SAVE;
+    case CTRL_KEY('a'): return ACT_SAVE_AS;
+    case CTRL_KEY('q'): return ACT_QUIT;
+    case CTRL_KEY('z'): return ACT_UNDO;
+    case CTRL_KEY('r'): return ACT_REDO;
+    case CTRL_KEY('b'): return ACT_SELECT;
+    case CTRL_KEY('c'): return ACT_COPY;
+    case CTRL_KEY('x'): return ACT_CUT;
+    case CTRL_KEY('v'): return ACT_PASTE;
+    case CTRL_KEY('u'): return ACT_WORD_PREV;
+    case CTRL_KEY('d'): return ACT_WORD_NEXT;
+    case CTRL_KEY('f'): return ACT_FIND;
+    case CTRL_KEY('h'): return ACT_REPLACE;
+    case CTRL_KEY('l'): return ACT_GOTO;
+    }
+
+    return ACT_NONE;
+}
+
 static void activate_menu(void)
 {
     int menu_index;
@@ -2208,8 +3346,23 @@ static void activate_menu(void)
 
         ch = getch();
 
-        if (ch == 27)
+        if (ch == 27 || ch == CTRL_KEY('t'))
             break;
+
+        {
+            int action;
+            action = shortcut_action(ch);
+
+            if (action != ACT_NONE) {
+                execute_action(action);
+
+                /*
+                 * Some actions, notably Quit, may return after a cancelled
+                 * confirmation.  In all cases close the menu cleanly.
+                 */
+                break;
+            }
+        }
 
         if (ch == KEY_LEFT) {
             menu_index--;
@@ -2247,8 +3400,7 @@ static void process_key(int ch)
     len = (int)strlen(lines[cy]);
 
     if (ch != CTRL_KEY('q'))
-        quit_armed = 0;
-
+    
     if (ch == CTRL_KEY('t')) {
         activate_menu();
         return;
@@ -2273,6 +3425,18 @@ static void process_key(int ch)
         quit_editor();
         break;
 
+    case CTRL_KEY('n'):
+        create_new_buffer();
+        break;
+
+    case CTRL_KEY('p'):
+        switch_buffer(-1);
+        break;
+
+    case CTRL_KEY('e'):
+        switch_buffer(1);
+        break;
+
     case CTRL_KEY('s'):
         do_save();
         break;
@@ -2283,6 +3447,14 @@ static void process_key(int ch)
 
     case CTRL_KEY('o'):
         do_open();
+        break;
+
+    case CTRL_KEY('u'):
+        move_word_left();
+        break;
+
+    case CTRL_KEY('d'):
+        move_word_right();
         break;
 
     case CTRL_KEY('f'):
@@ -2422,7 +3594,7 @@ static void process_key(int ch)
         if (ch >= 32 && ch <= 126) {
             if (selecting)
                 delete_selection();
-            insert_char(ch);
+            insert_typed_char(ch);
         }
         break;
     }
@@ -2481,11 +3653,20 @@ int main(int argc, char **argv)
 {
     int ch;
 
-    filename[0] = '\0';
+    {
+        int bi;
+        memset(buffers, 0, sizeof(buffers));
+        for (bi = 0; bi < MAX_BUFFERS; bi++)
+            buffers[bi].line_count = 0;
+    }
+
     statusmsg[0] = '\0';
     last_search[0] = '\0';
 
+    curbuf = 0;
+    buffer_count = 1;
     init_buffer();
+    load_config();
 
     if (argc > 1)
         load_file(argv[1]);
