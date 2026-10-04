@@ -1,0 +1,6 @@
+# TEDIT project commands
+# Copy to .tedit-project in the root of a project and edit as needed.
+
+build=make
+clean=make clean
+run=./a.out
