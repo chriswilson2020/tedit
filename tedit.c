@@ -71,6 +71,16 @@ extern int pclose(FILE *stream);
 
 #define CTRL_KEY(x) ((x) & 0x1f)
 
+/*
+ * Mouse support is intentionally opt-in.  Some classic curses
+ * implementations (notably IRIX) expose KEY_MOUSE-related macros but do not
+ * provide the ncurses MEVENT/getmouse API.  Define TEDIT_USE_MOUSE when
+ * building against a curses implementation that provides that API.
+ */
+#if defined(TEDIT_USE_MOUSE) && defined(KEY_MOUSE) && defined(ALL_MOUSE_EVENTS)
+#define TEDIT_HAVE_MOUSE 1
+#endif
+
 #define CP_NORMAL    1
 #define CP_KEYWORD   2
 #define CP_STRING    3
@@ -6166,7 +6176,7 @@ static void process_key(int ch)
         return;
     }
 
-#if defined(KEY_MOUSE) && defined(ALL_MOUSE_EVENTS)
+#ifdef TEDIT_HAVE_MOUSE
     if (ch == KEY_MOUSE) {
         MEVENT ev;
 
@@ -6556,7 +6566,7 @@ int main(int argc, char **argv)
     noecho();
     keypad(stdscr, TRUE);
 
-#if defined(KEY_MOUSE) && defined(ALL_MOUSE_EVENTS)
+#ifdef TEDIT_HAVE_MOUSE
     mousemask(ALL_MOUSE_EVENTS, NULL);
 #endif
 
