@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 260" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
 <title id="title">TEDIT</title>
 <desc id="desc">A terminal-green teddy bear wearing a command-line visor beside the TEDIT wordmark.</desc>
 <defs>
@@ -24,7 +24,7 @@
 <ellipse cx="214" cy="183" rx="48" ry="39" fill="#58e7aa"/>
 <path d="M195 175 Q214 158 233 175 Q225 190 214 190 Q203 190 195 175Z" fill="#0d0f10"/>
 <path d="M214 190 v13 M214 203 q-15 15 -30 0 M214 203 q15 15 30 0" fill="none" stroke="#0d0f10" stroke-width="7" stroke-linecap="round"/>
-<g fill="#63f6a7" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-weight="900" font-size="118" letter-spacing="10">
-  <text x="390" y="171">TEDIT</text>
+<g fill="#63f6a7" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-weight="900" font-size="110" letter-spacing="7">
+  <text x="375" y="171">TEDIT</text>
 </g>
 </svg>
