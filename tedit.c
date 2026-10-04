@@ -44,6 +44,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #include "syntax.h"
 #include "format.h"
 
@@ -63,6 +64,7 @@
 #define MAX_BUFFERS  8
 #define OUTPUT_MAX   256
 #define OUTPUT_LINE  512
+#define RECENT_MAX    16
 
 #define CTRL_KEY(x) ((x) & 0x1f)
 
@@ -134,6 +136,8 @@ enum {
     ACT_FIND_FILES,
     ACT_NEXT_RESULT,
     ACT_TOGGLE_OUTPUT,
+    ACT_OPEN_RECENT,
+    ACT_RECOVER,
     ACT_FIND,
     ACT_REPLACE,
     ACT_GOTO,
@@ -196,6 +200,15 @@ static int output_count = 0;
 static int output_visible = 0;
 static int output_cursor = 0;
 
+static int session_enabled = 1;
+static int recovery_enabled = 1;
+static int backup_enabled = 1;
+static int recovery_interval = 30;
+static time_t last_recovery_time = 0;
+
+static char recent_files[RECENT_MAX][PATH_LEN];
+static int recent_count = 0;
+
 static Snapshot undo_stack[UNDO_DEPTH];
 static int undo_count = 0;
 static Snapshot redo_stack[UNDO_DEPTH];
@@ -208,6 +221,8 @@ static const MenuItem file_menu[] = {
     {"Next buffer    ^E", ACT_NEXT_BUFFER},
     {"----------------", ACT_NONE},
     {"Open...        ^O", ACT_OPEN},
+    {"Open recent...", ACT_OPEN_RECENT},
+    {"Recover autosave...", ACT_RECOVER},
     {"Save           ^S", ACT_SAVE},
     {"Save As...     ^A", ACT_SAVE_AS},
     {"Close buffer", ACT_CLOSE_BUFFER},
@@ -304,6 +319,451 @@ static void set_status(const char *s)
     statusmsg[STATUS_LEN - 1] = '\0';
 }
 
+
+
+static void ensure_user_tedit_dirs(void)
+{
+    char path[PATH_LEN];
+    char *home;
+
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    sprintf(path, "%s/.tedit", home);
+    mkdir(path, 0700);
+
+    sprintf(path, "%s/.tedit/recovery", home);
+    mkdir(path, 0700);
+}
+
+static void recent_save(void)
+{
+    char path[PATH_LEN];
+    char *home;
+    FILE *fp;
+    int i;
+
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    ensure_user_tedit_dirs();
+    sprintf(path, "%s/.tedit/recent", home);
+
+    fp = fopen(path, "w");
+    if (fp == NULL)
+        return;
+
+    for (i = 0; i < recent_count; i++)
+        fprintf(fp, "%s\n", recent_files[i]);
+
+    fclose(fp);
+}
+
+static void recent_load(void)
+{
+    char path[PATH_LEN];
+    char line[PATH_LEN];
+    char *home;
+    FILE *fp;
+
+    recent_count = 0;
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    sprintf(path, "%s/.tedit/recent", home);
+    fp = fopen(path, "r");
+    if (fp == NULL)
+        return;
+
+    while (recent_count < RECENT_MAX &&
+           fgets(line, sizeof(line), fp) != NULL) {
+        int len;
+
+        len = (int)strlen(line);
+        while (len > 0 &&
+              (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        if (line[0] != '\0') {
+            strncpy(recent_files[recent_count], line, PATH_LEN - 1);
+            recent_files[recent_count][PATH_LEN - 1] = '\0';
+            recent_count++;
+        }
+    }
+
+    fclose(fp);
+}
+
+static void recent_add(const char *name)
+{
+    char full[PATH_LEN];
+    char cwd[PATH_LEN];
+    int i;
+    int found;
+
+    if (name == NULL || name[0] == '\0')
+        return;
+
+    if (name[0] == '/') {
+        strncpy(full, name, sizeof(full) - 1);
+        full[sizeof(full) - 1] = '\0';
+    } else if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        sprintf(full, "%s/%s", cwd, name);
+    } else {
+        strncpy(full, name, sizeof(full) - 1);
+        full[sizeof(full) - 1] = '\0';
+    }
+
+    found = -1;
+    for (i = 0; i < recent_count; i++) {
+        if (!strcmp(recent_files[i], full)) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found >= 0) {
+        for (i = found; i > 0; i--)
+            strcpy(recent_files[i], recent_files[i - 1]);
+    } else {
+        if (recent_count < RECENT_MAX)
+            recent_count++;
+        for (i = recent_count - 1; i > 0; i--)
+            strcpy(recent_files[i], recent_files[i - 1]);
+    }
+
+    strncpy(recent_files[0], full, PATH_LEN - 1);
+    recent_files[0][PATH_LEN - 1] = '\0';
+    recent_save();
+}
+
+static int recent_dialog(char *out, int outlen)
+{
+    int selected;
+    int ch;
+    int i;
+
+    if (recent_count <= 0) {
+        set_status("No recent files");
+        return 0;
+    }
+
+    selected = 0;
+
+    for (;;) {
+        erase();
+        attron(A_REVERSE);
+        mvaddstr(0, 0, " TEDIT Recent Files ");
+        clrtoeol();
+        attroff(A_REVERSE);
+
+        for (i = 0; i < recent_count && i < LINES - 4; i++) {
+            if (i == selected)
+                attron(A_REVERSE);
+
+            mvprintw(i + 2, 2, "%2d  ", i + 1);
+            addnstr(recent_files[i], COLS - 8);
+
+            if (i == selected)
+                attroff(A_REVERSE);
+        }
+
+        mvaddstr(LINES - 1, 0, "Enter open  Up/Down move  Esc cancel");
+        refresh();
+
+        ch = getch();
+
+        if (ch == 27)
+            return 0;
+        if (ch == KEY_UP && selected > 0)
+            selected--;
+        else if (ch == KEY_DOWN && selected + 1 < recent_count)
+            selected++;
+        else if (ch == '\n' || ch == '\r') {
+            strncpy(out, recent_files[selected], outlen - 1);
+            out[outlen - 1] = '\0';
+            return 1;
+        }
+    }
+}
+
+static void do_open_recent(void)
+{
+    char path[PATH_LEN];
+
+    if (modified) {
+        set_status("Unsaved changes: save or use a new buffer first");
+        return;
+    }
+
+    if (recent_dialog(path, sizeof(path)))
+        load_file(path);
+}
+
+static void backup_existing_file(const char *name)
+{
+    char backup[PATH_LEN];
+    FILE *in;
+    FILE *out;
+    char buf[4096];
+    size_t n;
+
+    if (!backup_enabled || !path_exists(name))
+        return;
+
+    sprintf(backup, "%s~", name);
+
+    in = fopen(name, "rb");
+    if (in == NULL)
+        return;
+
+    out = fopen(backup, "wb");
+    if (out == NULL) {
+        fclose(in);
+        return;
+    }
+
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+        fwrite(buf, 1, n, out);
+
+    fclose(out);
+    fclose(in);
+}
+
+static void write_recovery_files(void)
+{
+    char *home;
+    int bi;
+
+    if (!recovery_enabled)
+        return;
+
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    ensure_user_tedit_dirs();
+
+    for (bi = 0; bi < buffer_count; bi++) {
+        Buffer *b;
+        char path[PATH_LEN];
+        char meta[PATH_LEN];
+        FILE *fp;
+        int row;
+
+        b = &buffers[bi];
+
+        if (!b->dirty)
+            continue;
+
+        sprintf(path, "%s/.tedit/recovery/buffer%d.tmp", home, bi);
+        fp = fopen(path, "w");
+        if (fp != NULL) {
+            for (row = 0; row < b->line_count; row++) {
+                fputs(b->linev[row], fp);
+                if (row < b->line_count - 1)
+                    fputc('\n', fp);
+            }
+            fclose(fp);
+        }
+
+        sprintf(meta, "%s/.tedit/recovery/buffer%d.meta", home, bi);
+        fp = fopen(meta, "w");
+        if (fp != NULL) {
+            fprintf(fp, "%s\n", b->fname[0] ? b->fname : "[No Name]");
+            fclose(fp);
+        }
+    }
+}
+
+static void clear_recovery_files(void)
+{
+    char *home;
+    int bi;
+
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    for (bi = 0; bi < MAX_BUFFERS; bi++) {
+        char path[PATH_LEN];
+
+        sprintf(path, "%s/.tedit/recovery/buffer%d.tmp", home, bi);
+        unlink(path);
+        sprintf(path, "%s/.tedit/recovery/buffer%d.meta", home, bi);
+        unlink(path);
+    }
+}
+
+static void maybe_write_recovery(void)
+{
+    time_t now;
+
+    if (!recovery_enabled)
+        return;
+
+    now = time(NULL);
+
+    if (last_recovery_time == 0 ||
+        now - last_recovery_time >= recovery_interval) {
+        write_recovery_files();
+        last_recovery_time = now;
+    }
+}
+
+static void do_recover(void)
+{
+    char *home;
+    char oldcwd[PATH_LEN];
+    char dir[PATH_LEN];
+    char path[PATH_LEN];
+
+    home = getenv("HOME");
+    if (home == NULL) {
+        set_status("HOME is not set");
+        return;
+    }
+
+    ensure_user_tedit_dirs();
+    sprintf(dir, "%s/.tedit/recovery", home);
+
+    if (getcwd(oldcwd, sizeof(oldcwd)) == NULL)
+        oldcwd[0] = '\0';
+
+    if (chdir(dir) != 0) {
+        set_status("No recovery directory");
+        return;
+    }
+
+    if (file_browser(path, sizeof(path))) {
+        load_file(path);
+        modified = 1;
+        set_status("Recovered autosave; use Save As");
+    } else {
+        set_status("Recovery cancelled");
+    }
+
+    if (oldcwd[0] != '\0')
+        chdir(oldcwd);
+}
+
+static void save_session(void)
+{
+    char *home;
+    char path[PATH_LEN];
+    FILE *fp;
+    int bi;
+
+    if (!session_enabled)
+        return;
+
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    ensure_user_tedit_dirs();
+    sprintf(path, "%s/.tedit/session", home);
+
+    fp = fopen(path, "w");
+    if (fp == NULL)
+        return;
+
+    fprintf(fp, "current=%d\n", curbuf);
+
+    for (bi = 0; bi < buffer_count; bi++) {
+        if (buffers[bi].fname[0] != '\0')
+            fprintf(fp, "file=%s\t%d\t%d\n",
+                    buffers[bi].fname,
+                    buffers[bi].cursor_y,
+                    buffers[bi].cursor_x);
+    }
+
+    fclose(fp);
+}
+
+static void restore_session(void)
+{
+    char *home;
+    char path[PATH_LEN];
+    char line[PATH_LEN + 64];
+    FILE *fp;
+    int loaded;
+
+    if (!session_enabled)
+        return;
+
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    sprintf(path, "%s/.tedit/session", home);
+    fp = fopen(path, "r");
+    if (fp == NULL)
+        return;
+
+    loaded = 0;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (!strncmp(line, "file=", 5)) {
+            char *name;
+            char *t1;
+            char *t2;
+            int sy;
+            int sx;
+
+            name = line + 5;
+            t1 = strchr(name, '\t');
+            if (t1 == NULL)
+                continue;
+            *t1++ = '\0';
+
+            t2 = strchr(t1, '\t');
+            if (t2 == NULL)
+                continue;
+            *t2++ = '\0';
+
+            sy = atoi(t1);
+            sx = atoi(t2);
+
+            {
+                int len;
+                len = (int)strlen(t2);
+                while (len > 0 &&
+                      (t2[len - 1] == '\n' || t2[len - 1] == '\r'))
+                    t2[--len] = '\0';
+            }
+
+            if (!path_exists(name))
+                continue;
+
+            if (loaded > 0) {
+                if (!create_new_buffer())
+                    break;
+            }
+
+            load_file(name);
+            cy = sy;
+            if (cy < 0) cy = 0;
+            if (cy >= nlines) cy = nlines - 1;
+            cx = sx;
+            if (cx < 0) cx = 0;
+            if (cx > (int)strlen(lines[cy]))
+                cx = (int)strlen(lines[cy]);
+
+            loaded++;
+        }
+    }
+
+    fclose(fp);
+
+    if (loaded > 0) {
+        curbuf = 0;
+        set_status("Session restored");
+    }
+}
 
 static int output_pane_height(void)
 {
@@ -1070,6 +1530,23 @@ static void load_config(void)
         } else if (!strncmp(buf, "syntaxdir=", 10)) {
             strncpy(syntax_dir_override, buf + 10, PATH_LEN - 1);
             syntax_dir_override[PATH_LEN - 1] = '\0';
+        } else if (!strcmp(buf, "session=on")) {
+            session_enabled = 1;
+        } else if (!strcmp(buf, "session=off")) {
+            session_enabled = 0;
+        } else if (!strcmp(buf, "recovery=on")) {
+            recovery_enabled = 1;
+        } else if (!strcmp(buf, "recovery=off")) {
+            recovery_enabled = 0;
+        } else if (!strcmp(buf, "backup=on")) {
+            backup_enabled = 1;
+        } else if (!strcmp(buf, "backup=off")) {
+            backup_enabled = 0;
+        } else if (!strncmp(buf, "recovery_interval=", 18)) {
+            int sec;
+            sec = atoi(buf + 18);
+            if (sec >= 5 && sec <= 3600)
+                recovery_interval = sec;
         }
     }
 
@@ -1099,6 +1576,7 @@ static int load_file(const char *name)
         clear_stack(undo_stack, &undo_count);
         clear_stack(redo_stack, &redo_count);
 
+        recent_add(filename);
         sprintf(statusmsg, "New file: %s", filename);
         return 0;
     }
@@ -1140,6 +1618,7 @@ static int load_file(const char *name)
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
 
+    recent_add(filename);
     sprintf(statusmsg, "Loaded %s", filename);
 
     return 0;
@@ -1150,6 +1629,7 @@ static int save_file_as(const char *name)
     FILE *fp;
     int i;
 
+    backup_existing_file(name);
     fp = fopen(name, "w");
     if (fp == NULL) {
         sprintf(statusmsg, "Cannot write %s", name);
@@ -1168,6 +1648,7 @@ static int save_file_as(const char *name)
     filename[NAME_LEN - 1] = '\0';
 
     modified = 0;
+    recent_add(filename);
     sprintf(statusmsg, "Saved %s", filename);
 
     return 0;
@@ -2622,6 +3103,7 @@ static void draw_screen(void)
     int status_y;
     scroll_screen();
     compute_bracket_match();
+    maybe_write_recovery();
     erase();
 
     if (use_color)
@@ -3297,22 +3779,63 @@ static int find_from_position(const char *needle, int start_row, int start_col)
 static void do_find(void)
 {
     char query[SEARCH_LEN];
+    int qlen;
+    int ch;
+    int orig_y;
+    int orig_x;
 
-    if (!prompt_input("Find: ", query, sizeof(query))) {
-        set_status("Find cancelled");
-        return;
+    query[0] = '\0';
+    qlen = 0;
+    orig_y = cy;
+    orig_x = cx;
+
+    for (;;) {
+        draw_screen();
+        move(LINES - 1, 0);
+        clrtoeol();
+        mvaddstr(LINES - 1, 0, "I-search: ");
+        addnstr(query, COLS - 12);
+        refresh();
+
+        ch = getch();
+
+        if (ch == 27) {
+            cy = orig_y;
+            cx = orig_x;
+            scroll_screen();
+            set_status("Incremental search cancelled");
+            return;
+        }
+
+        if (ch == '\n' || ch == '\r') {
+            if (query[0] != '\0') {
+                strncpy(last_search, query, SEARCH_LEN - 1);
+                last_search[SEARCH_LEN - 1] = '\0';
+                sprintf(statusmsg, "Found: %s", query);
+            }
+            return;
+        }
+
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (qlen > 0)
+                query[--qlen] = '\0';
+        } else if (ch >= 32 && ch <= 126 && qlen < SEARCH_LEN - 1) {
+            query[qlen++] = (char)ch;
+            query[qlen] = '\0';
+        } else {
+            continue;
+        }
+
+        cy = orig_y;
+        cx = orig_x;
+
+        if (query[0] != '\0') {
+            if (!find_from_position(query, orig_y, orig_x))
+                set_status("No match");
+            else
+                set_status("Incremental match");
+        }
     }
-
-    if (!query[0])
-        return;
-
-    strncpy(last_search, query, SEARCH_LEN - 1);
-    last_search[SEARCH_LEN - 1] = '\0';
-
-    if (find_from_position(last_search, cy, cx + 1))
-        sprintf(statusmsg, "Found: %s", last_search);
-    else
-        sprintf(statusmsg, "Not found: %s", last_search);
 }
 
 static void do_replace(void)
@@ -3457,7 +3980,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 2");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 3");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -3524,6 +4047,9 @@ static void quit_editor(void)
             return;
         }
     }
+
+    save_session();
+    clear_recovery_files();
 
     erase();
     refresh();
@@ -3608,6 +4134,8 @@ static void execute_action(int action)
         output_visible = !output_visible;
         set_status(output_visible ? "Output pane shown" : "Output pane hidden");
         break;
+    case ACT_OPEN_RECENT: do_open_recent(); break;
+    case ACT_RECOVER: do_recover(); break;
     case ACT_FIND: do_find(); break;
     case ACT_REPLACE: do_replace(); break;
     case ACT_GOTO: do_goto(); break;
@@ -4182,9 +4710,12 @@ int main(int argc, char **argv)
     init_buffer();
     load_config();
     load_syntax_definitions();
+    recent_load();
 
     if (argc > 1)
         load_file(argv[1]);
+    else
+        restore_session();
 
     initscr();
     raw();
