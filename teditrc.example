@@ -1,0 +1,11 @@
+# TEDIT user configuration
+# Copy to ~/.teditrc
+
+tabwidth=4
+linenumbers=on
+syntax=on
+autopairs=on
+
+# Optional: extra syntax definitions or overrides.
+# ~ is expanded by TEDIT for this setting.
+# syntaxdir=~/.tedit/syntax
