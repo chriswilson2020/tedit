@@ -48,6 +48,9 @@
 #include "syntax.h"
 #include "format.h"
 
+extern FILE *popen(const char *command, const char *type);
+extern int pclose(FILE *stream);
+
 #ifndef TEDIT_SYSTEM_SYNTAX_DIR
 #define TEDIT_SYSTEM_SYNTAX_DIR "/usr/local/share/tedit/syntax"
 #endif
@@ -314,6 +317,7 @@ static int file_browser(char *out, int outlen);
 static int load_file(const char *name);
 static int path_exists(const char *path);
 static int create_new_buffer(void);
+static void scroll_screen(void);
 
 static void set_status(const char *s)
 {
@@ -3755,7 +3759,11 @@ static void browser_draw_pane(BrowserPane *pane, int active,
 
         idx = pane->top + i;
         move(y + 1 + i, x + 1);
-        clrtoeol();
+        {
+            int blank;
+            for (blank = 0; blank < width - 2; blank++)
+                addch(' ');
+        }
 
         if (idx >= pane->count)
             continue;
