@@ -3319,7 +3319,21 @@ typedef struct {
     int isdir;
     long size;
     unsigned long mode;
+    time_t mtime;
 } BrowserEntry;
+
+typedef struct {
+    char path[PATH_LEN];
+    BrowserEntry *entries;
+    int count;
+    int selected;
+    int top;
+} BrowserPane;
+
+static int browser_sort_mode = 0;
+static int browser_show_hidden = 0;
+static char browser_bookmarks[8][PATH_LEN];
+static int browser_bookmark_count = 0;
 
 static int browser_cmp(const void *a, const void *b)
 {
@@ -3331,6 +3345,14 @@ static int browser_cmp(const void *a, const void *b)
 
     if (ea->isdir != eb->isdir)
         return eb->isdir - ea->isdir;
+
+    if (browser_sort_mode == 1) {
+        if (ea->size < eb->size) return 1;
+        if (ea->size > eb->size) return -1;
+    } else if (browser_sort_mode == 2) {
+        if (ea->mtime < eb->mtime) return 1;
+        if (ea->mtime > eb->mtime) return -1;
+    }
 
     return strcmp(ea->name, eb->name);
 }
@@ -3366,7 +3388,8 @@ static void path_join(char *out, const char *dir, const char *name)
         sprintf(out, "%s/%s", dir, name);
 }
 
-static int browser_load(const char *path, BrowserEntry *entries, int max_entries)
+static int browser_load(const char *path, BrowserEntry *entries,
+                        int max_entries, int show_hidden)
 {
     DIR *dp;
     struct dirent *de;
@@ -3382,7 +3405,10 @@ static int browser_load(const char *path, BrowserEntry *entries, int max_entries
         char full[PATH_LEN];
         struct stat st;
 
-        if (!strcmp(de->d_name, "."))
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+
+        if (!show_hidden && de->d_name[0] == '.')
             continue;
 
         strncpy(entries[count].name, de->d_name, NAME_LEN - 1);
@@ -3394,10 +3420,12 @@ static int browser_load(const char *path, BrowserEntry *entries, int max_entries
             entries[count].isdir = S_ISDIR(st.st_mode) ? 1 : 0;
             entries[count].size = (long)st.st_size;
             entries[count].mode = (unsigned long)st.st_mode;
+            entries[count].mtime = st.st_mtime;
         } else {
             entries[count].isdir = 0;
             entries[count].size = 0;
             entries[count].mode = 0;
+            entries[count].mtime = 0;
         }
 
         count++;
@@ -3408,7 +3436,6 @@ static int browser_load(const char *path, BrowserEntry *entries, int max_entries
     qsort(entries, count, sizeof(BrowserEntry), browser_cmp);
     return count;
 }
-
 
 static void draw_hline_ascii(int y, int x, int width)
 {
@@ -3454,223 +3481,390 @@ static void human_size(long bytes, char *out, int outlen)
     out[outlen - 1] = '\0';
 }
 
-static void browser_preview_text(const char *path,
-                                 int y, int x, int height, int width)
+static int copy_file_data(const char *src, const char *dst)
 {
-    FILE *fp;
-    char buf[256];
-    int row;
+    FILE *in;
+    FILE *out;
+    char buf[8192];
+    size_t n;
 
-    fp = fopen(path, "r");
+    in = fopen(src, "rb");
+    if (in == NULL)
+        return -1;
 
-    if (fp == NULL) {
-        mvaddnstr(y, x, "(preview unavailable)", width);
-        return;
+    out = fopen(dst, "wb");
+    if (out == NULL) {
+        fclose(in);
+        return -1;
     }
 
-    row = 0;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(out);
+            fclose(in);
+            return -1;
+        }
+    }
 
-    while (row < height && fgets(buf, sizeof(buf), fp) != NULL) {
-        int i;
+    fclose(out);
+    fclose(in);
+    return 0;
+}
 
-        for (i = 0; buf[i] != '\0'; i++) {
-            unsigned char c;
+static int copy_tree(const char *src, const char *dst)
+{
+    struct stat st;
 
-            c = (unsigned char)buf[i];
+    if (stat(src, &st) != 0)
+        return -1;
 
-            if (c == '\n' || c == '\r') {
-                buf[i] = '\0';
-                break;
-            }
+    if (S_ISDIR(st.st_mode)) {
+        DIR *dp;
+        struct dirent *de;
 
-            if (c < 32 && c != '\t') {
-                strcpy(buf, "(binary/non-text file)");
-                row = height - 1;
-                break;
+        mkdir(dst, st.st_mode & 0777);
+        dp = opendir(src);
+        if (dp == NULL)
+            return -1;
+
+        while ((de = readdir(dp)) != NULL) {
+            char s[PATH_LEN];
+            char d[PATH_LEN];
+
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+
+            path_join(s, src, de->d_name);
+            path_join(d, dst, de->d_name);
+
+            if (copy_tree(s, d) != 0) {
+                closedir(dp);
+                return -1;
             }
         }
 
-        mvaddnstr(y + row, x, buf, width);
-        row++;
+        closedir(dp);
+        return 0;
+    }
+
+    return copy_file_data(src, dst);
+}
+
+static int remove_tree(const char *path)
+{
+    struct stat st;
+
+    if (stat(path, &st) != 0)
+        return -1;
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR *dp;
+        struct dirent *de;
+
+        dp = opendir(path);
+        if (dp == NULL)
+            return -1;
+
+        while ((de = readdir(dp)) != NULL) {
+            char child[PATH_LEN];
+
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+
+            path_join(child, path, de->d_name);
+
+            if (remove_tree(child) != 0) {
+                closedir(dp);
+                return -1;
+            }
+        }
+
+        closedir(dp);
+        return rmdir(path);
+    }
+
+    return unlink(path);
+}
+
+static void browser_bookmarks_load(void)
+{
+    char *home;
+    char path[PATH_LEN];
+    char line[PATH_LEN];
+    FILE *fp;
+
+    browser_bookmark_count = 0;
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    sprintf(path, "%s/.tedit/browser-bookmarks", home);
+    fp = fopen(path, "r");
+    if (fp == NULL)
+        return;
+
+    while (browser_bookmark_count < 8 &&
+           fgets(line, sizeof(line), fp) != NULL) {
+        int len;
+
+        len = (int)strlen(line);
+        while (len > 0 &&
+              (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        if (line[0] != '\0') {
+            strncpy(browser_bookmarks[browser_bookmark_count],
+                    line, PATH_LEN - 1);
+            browser_bookmarks[browser_bookmark_count][PATH_LEN - 1] = '\0';
+            browser_bookmark_count++;
+        }
     }
 
     fclose(fp);
 }
 
-static int file_browser(char *out, int outlen)
+static void browser_bookmarks_save(void)
 {
-    BrowserEntry entries[BROWSER_MAX];
+    char *home;
     char path[PATH_LEN];
-    char full[PATH_LEN];
-    int count;
-    int selected;
-    int top;
-    int ch;
+    FILE *fp;
+    int i;
 
-    if (getcwd(path, sizeof(path)) == NULL)
-        strcpy(path, ".");
+    home = getenv("HOME");
+    if (home == NULL)
+        return;
+
+    ensure_user_tedit_dirs();
+    sprintf(path, "%s/.tedit/browser-bookmarks", home);
+
+    fp = fopen(path, "w");
+    if (fp == NULL)
+        return;
+
+    for (i = 0; i < browser_bookmark_count; i++)
+        fprintf(fp, "%s\n", browser_bookmarks[i]);
+
+    fclose(fp);
+}
+
+static void browser_add_bookmark(const char *path)
+{
+    int i;
+
+    for (i = 0; i < browser_bookmark_count; i++) {
+        if (!strcmp(browser_bookmarks[i], path)) {
+            set_status("Directory already bookmarked");
+            return;
+        }
+    }
+
+    if (browser_bookmark_count < 8) {
+        strncpy(browser_bookmarks[browser_bookmark_count],
+                path, PATH_LEN - 1);
+        browser_bookmarks[browser_bookmark_count][PATH_LEN - 1] = '\0';
+        browser_bookmark_count++;
+    } else {
+        for (i = 1; i < 8; i++)
+            strcpy(browser_bookmarks[i - 1], browser_bookmarks[i]);
+        strncpy(browser_bookmarks[7], path, PATH_LEN - 1);
+        browser_bookmarks[7][PATH_LEN - 1] = '\0';
+    }
+
+    browser_bookmarks_save();
+    set_status("Directory bookmarked");
+}
+
+static int browser_choose_bookmark(char *out, int outlen)
+{
+    int selected;
+    int ch;
+    int i;
+
+    if (browser_bookmark_count <= 0) {
+        set_status("No browser bookmarks");
+        return 0;
+    }
 
     selected = 0;
-    top = 0;
 
     for (;;) {
-        int i;
+        erase();
+        attron(A_REVERSE);
+        mvaddstr(0, 0, " TEDIT Directory Bookmarks ");
+        clrtoeol();
+        attroff(A_REVERSE);
+
+        for (i = 0; i < browser_bookmark_count; i++) {
+            if (i == selected)
+                attron(A_REVERSE);
+            mvprintw(i + 2, 2, "%d  ", i + 1);
+            addnstr(browser_bookmarks[i], COLS - 8);
+            if (i == selected)
+                attroff(A_REVERSE);
+        }
+
+        mvaddstr(LINES - 1, 0, "Enter jump  Up/Down move  Esc cancel");
+        refresh();
+
+        ch = getch();
+
+        if (ch == 27)
+            return 0;
+        if (ch == KEY_UP && selected > 0)
+            selected--;
+        else if (ch == KEY_DOWN && selected + 1 < browser_bookmark_count)
+            selected++;
+        else if (ch == '\n' || ch == '\r') {
+            strncpy(out, browser_bookmarks[selected], outlen - 1);
+            out[outlen - 1] = '\0';
+            return 1;
+        }
+    }
+}
+
+static void browser_draw_pane(BrowserPane *pane, int active,
+                              int y, int x, int height, int width)
+{
+    int rows;
+    int i;
+
+    draw_box_ascii(y, x, height, width);
+
+    if (active)
+        attron(A_REVERSE);
+
+    mvaddnstr(y, x + 2, pane->path, width - 4);
+
+    if (active)
+        attroff(A_REVERSE);
+
+    rows = height - 2;
+
+    if (pane->selected < pane->top)
+        pane->top = pane->selected;
+    if (pane->selected >= pane->top + rows)
+        pane->top = pane->selected - rows + 1;
+    if (pane->top < 0)
+        pane->top = 0;
+
+    for (i = 0; i < rows; i++) {
+        int idx;
+        char display[NAME_LEN + 32];
+        char sizebuf[32];
+        int avail;
+
+        idx = pane->top + i;
+        move(y + 1 + i, x + 1);
+        clrtoeol();
+
+        if (idx >= pane->count)
+            continue;
+
+        avail = width - 15;
+        if (avail < 4)
+            avail = 4;
+
+        if (pane->entries[idx].isdir) {
+            sprintf(display, "/ %-*.*s",
+                    avail, avail, pane->entries[idx].name);
+        } else {
+            human_size(pane->entries[idx].size, sizebuf, sizeof(sizebuf));
+            sprintf(display, "  %-*.*s %8s",
+                    avail, avail, pane->entries[idx].name, sizebuf);
+        }
+
+        if (active && idx == pane->selected)
+            attron(A_REVERSE);
+
+        mvaddnstr(y + 1 + i, x + 1, display, width - 2);
+
+        if (active && idx == pane->selected)
+            attroff(A_REVERSE);
+    }
+}
+
+static void browser_reload(BrowserPane *pane)
+{
+    pane->count = browser_load(pane->path, pane->entries,
+                               BROWSER_MAX, browser_show_hidden);
+
+    if (pane->count < 0)
+        pane->count = 0;
+
+    if (pane->selected >= pane->count)
+        pane->selected = pane->count > 0 ? pane->count - 1 : 0;
+
+    if (pane->selected < 0)
+        pane->selected = 0;
+}
+
+static int file_browser(char *out, int outlen)
+{
+    static BrowserEntry left_entries[BROWSER_MAX];
+    static BrowserEntry right_entries[BROWSER_MAX];
+    BrowserPane pane[2];
+    char cwd[PATH_LEN];
+    int active;
+    int ch;
+
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
+        strcpy(cwd, ".");
+
+    memset(&pane, 0, sizeof(pane));
+
+    strncpy(pane[0].path, cwd, PATH_LEN - 1);
+    pane[0].path[PATH_LEN - 1] = '\0';
+    strncpy(pane[1].path, cwd, PATH_LEN - 1);
+    pane[1].path[PATH_LEN - 1] = '\0';
+
+    pane[0].entries = left_entries;
+    pane[1].entries = right_entries;
+    active = 0;
+
+    browser_bookmarks_load();
+
+    for (;;) {
         int body_y;
         int body_h;
-        int left_x;
         int left_w;
-        int right_x;
         int right_w;
-        int list_rows;
+        BrowserPane *p;
+        BrowserPane *other;
 
-        count = browser_load(path, entries, BROWSER_MAX);
+        browser_reload(&pane[0]);
+        browser_reload(&pane[1]);
 
-        if (count < 0) {
-            set_status("Cannot open directory");
-            return 0;
-        }
+        p = &pane[active];
+        other = &pane[1 - active];
 
-        if (selected >= count)
-            selected = count > 0 ? count - 1 : 0;
+        body_y = 2;
+        body_h = LINES - 5;
+        if (body_h < 6)
+            body_h = 6;
 
-        body_y = 3;
-        body_h = LINES - 6;
-
-        if (body_h < 8)
-            body_h = 8;
-
-        left_x = 1;
-        left_w = (COLS * 3) / 5;
-
-        if (left_w < 28)
-            left_w = COLS - 2;
-
-        right_x = left_x + left_w;
-        right_w = COLS - right_x - 1;
-
-        if (right_w < 22) {
-            right_w = 0;
-            left_w = COLS - 2;
-        }
-
-        list_rows = body_h - 2;
-
-        if (selected < top)
-            top = selected;
-
-        if (selected >= top + list_rows)
-            top = selected - list_rows + 1;
-
-        if (top < 0)
-            top = 0;
+        left_w = (COLS - 3) / 2;
+        right_w = COLS - left_w - 3;
 
         erase();
 
         attron(A_REVERSE);
-        mvaddstr(0, 0, " TEDIT Open File ");
+        mvaddstr(0, 0, " TEDIT File Navigator ");
         clrtoeol();
         attroff(A_REVERSE);
 
-        mvaddstr(1, 1, "Path: ");
-        mvaddnstr(1, 7, path, COLS - 8);
-
-        draw_box_ascii(body_y, left_x, body_h, left_w);
-
-        if (right_w > 0)
-            draw_box_ascii(body_y, right_x, body_h, right_w);
-
-        mvaddstr(body_y, left_x + 2, " Files ");
-
-        if (right_w > 0)
-            mvaddstr(body_y, right_x + 2, " Info / Preview ");
-
-        for (i = 0; i < list_rows; i++) {
-            int idx;
-            char display[NAME_LEN + 32];
-            char sizebuf[32];
-            int avail;
-
-            idx = top + i;
-
-            if (idx >= count)
-                break;
-
-            if (entries[idx].isdir) {
-                sprintf(display, "/ %-*.*s",
-                        left_w - 6, left_w - 6,
-                        entries[idx].name);
-            } else {
-                human_size(entries[idx].size, sizebuf, sizeof(sizebuf));
-                avail = left_w - 16;
-
-                if (avail < 6)
-                    avail = 6;
-
-                sprintf(display, "  %-*.*s %8s",
-                        avail, avail,
-                        entries[idx].name,
-                        sizebuf);
-            }
-
-            if (idx == selected)
-                attron(A_REVERSE);
-
-            mvaddnstr(body_y + 1 + i,
-                      left_x + 1,
-                      display,
-                      left_w - 2);
-
-            if (idx == selected)
-                attroff(A_REVERSE);
-        }
-
-        if (right_w > 0 && count > 0) {
-            int info_y;
-            char sizebuf[32];
-
-            path_join(full, path, entries[selected].name);
-            info_y = body_y + 2;
-
-            mvaddstr(info_y, right_x + 2, "Name:");
-            mvaddnstr(info_y + 1,
-                      right_x + 2,
-                      entries[selected].name,
-                      right_w - 4);
-
-            mvaddstr(info_y + 3, right_x + 2, "Type:");
-            mvaddstr(info_y + 4,
-                     right_x + 2,
-                     entries[selected].isdir ? "Directory" : "File");
-
-            if (!entries[selected].isdir) {
-                human_size(entries[selected].size, sizebuf, sizeof(sizebuf));
-
-                mvaddstr(info_y + 6, right_x + 2, "Size:");
-                mvaddstr(info_y + 7, right_x + 2, sizebuf);
-
-                if (body_h > 15) {
-                    mvaddstr(info_y + 9, right_x + 2, "Preview:");
-                    browser_preview_text(full,
-                                         info_y + 10,
-                                         right_x + 2,
-                                         body_h - 13,
-                                         right_w - 4);
-                }
-            } else {
-                mvaddstr(info_y + 6,
-                         right_x + 2,
-                         "Enter to browse");
-            }
-        }
+        browser_draw_pane(&pane[0], active == 0,
+                          body_y, 1, body_h, left_w);
+        browser_draw_pane(&pane[1], active == 1,
+                          body_y, left_w + 2, body_h, right_w);
 
         attron(A_REVERSE);
         mvaddstr(LINES - 2, 0,
-                 " Up/Down Move  Enter Open/Browse  Backspace Parent  Esc Cancel ");
+                 " Tab Pane  Enter Open  BS Parent  c Copy  m Move  d Delete  r Rename ");
         clrtoeol();
         attroff(A_REVERSE);
 
-        mvaddstr(LINES - 1, 1,
-                 "Directories are shown first. File sizes appear in the left panel.");
+        mvaddstr(LINES - 1, 0,
+                 " n Mkdir  g Go  b Bookmark  j Jump  h Hidden  s Sort  Esc Cancel");
 
         refresh();
         ch = getch();
@@ -3678,51 +3872,208 @@ static int file_browser(char *out, int outlen)
         if (ch == 27)
             return 0;
 
+        if (ch == '\t') {
+            active = 1 - active;
+            continue;
+        }
+
         if (ch == KEY_UP) {
-            if (selected > 0)
-                selected--;
-        } else if (ch == KEY_DOWN) {
-            if (selected + 1 < count)
-                selected++;
+            if (p->selected > 0)
+                p->selected--;
+            continue;
+        }
+
+        if (ch == KEY_DOWN) {
+            if (p->selected + 1 < p->count)
+                p->selected++;
+            continue;
+        }
+
 #ifdef KEY_PPAGE
-        } else if (ch == KEY_PPAGE) {
-            selected -= list_rows;
-
-            if (selected < 0)
-                selected = 0;
+        if (ch == KEY_PPAGE) {
+            p->selected -= body_h - 2;
+            if (p->selected < 0)
+                p->selected = 0;
+            continue;
+        }
 #endif
+
 #ifdef KEY_NPAGE
-        } else if (ch == KEY_NPAGE) {
-            selected += list_rows;
-
-            if (selected >= count)
-                selected = count > 0 ? count - 1 : 0;
+        if (ch == KEY_NPAGE) {
+            p->selected += body_h - 2;
+            if (p->selected >= p->count)
+                p->selected = p->count > 0 ? p->count - 1 : 0;
+            continue;
+        }
 #endif
+
 #ifdef KEY_HOME
-        } else if (ch == KEY_HOME) {
-            selected = 0;
+        if (ch == KEY_HOME) {
+            p->selected = 0;
+            continue;
+        }
 #endif
-#ifdef KEY_END
-        } else if (ch == KEY_END) {
-            selected = count > 0 ? count - 1 : 0;
-#endif
-        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-            path_parent(path);
-            selected = 0;
-            top = 0;
-        } else if ((ch == '\n' || ch == '\r') && count > 0) {
-            path_join(full, path, entries[selected].name);
 
-            if (entries[selected].isdir) {
-                strncpy(path, full, sizeof(path) - 1);
-                path[sizeof(path) - 1] = '\0';
-                selected = 0;
-                top = 0;
+#ifdef KEY_END
+        if (ch == KEY_END) {
+            p->selected = p->count > 0 ? p->count - 1 : 0;
+            continue;
+        }
+#endif
+
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            path_parent(p->path);
+            p->selected = 0;
+            p->top = 0;
+            continue;
+        }
+
+        if ((ch == '\n' || ch == '\r' || ch == 'o') && p->count > 0) {
+            char full[PATH_LEN];
+
+            path_join(full, p->path, p->entries[p->selected].name);
+
+            if (p->entries[p->selected].isdir) {
+                strncpy(p->path, full, PATH_LEN - 1);
+                p->path[PATH_LEN - 1] = '\0';
+                p->selected = 0;
+                p->top = 0;
             } else {
                 strncpy(out, full, outlen - 1);
                 out[outlen - 1] = '\0';
                 return 1;
             }
+
+            continue;
+        }
+
+        if (ch == 'h' || ch == 'H') {
+            browser_show_hidden = !browser_show_hidden;
+            pane[0].selected = pane[1].selected = 0;
+            pane[0].top = pane[1].top = 0;
+            continue;
+        }
+
+        if (ch == 's' || ch == 'S') {
+            browser_sort_mode++;
+            if (browser_sort_mode > 2)
+                browser_sort_mode = 0;
+            pane[0].selected = pane[1].selected = 0;
+            continue;
+        }
+
+        if (ch == 'g' || ch == 'G') {
+            char path[PATH_LEN];
+
+            if (prompt_input("Go to directory: ", path, sizeof(path)) &&
+                path[0] != '\0' && path_exists(path)) {
+                strncpy(p->path, path, PATH_LEN - 1);
+                p->path[PATH_LEN - 1] = '\0';
+                p->selected = 0;
+                p->top = 0;
+            }
+            continue;
+        }
+
+        if (ch == 'b' || ch == 'B') {
+            browser_add_bookmark(p->path);
+            continue;
+        }
+
+        if (ch == 'j' || ch == 'J') {
+            char path[PATH_LEN];
+
+            if (browser_choose_bookmark(path, sizeof(path))) {
+                strncpy(p->path, path, PATH_LEN - 1);
+                p->path[PATH_LEN - 1] = '\0';
+                p->selected = 0;
+                p->top = 0;
+            }
+            continue;
+        }
+
+        if (ch == 'n' || ch == 'N') {
+            char name[NAME_LEN];
+            char full[PATH_LEN];
+
+            if (prompt_input("New directory: ", name, sizeof(name)) &&
+                name[0] != '\0') {
+                path_join(full, p->path, name);
+                if (mkdir(full, 0755) != 0)
+                    set_status("Cannot create directory");
+                else
+                    set_status("Directory created");
+            }
+            continue;
+        }
+
+        if ((ch == 'r' || ch == 'R') && p->count > 0) {
+            char name[NAME_LEN];
+            char src[PATH_LEN];
+            char dst[PATH_LEN];
+
+            if (prompt_input("Rename to: ", name, sizeof(name)) &&
+                name[0] != '\0') {
+                path_join(src, p->path, p->entries[p->selected].name);
+                path_join(dst, p->path, name);
+
+                if (rename(src, dst) != 0)
+                    set_status("Rename failed");
+                else
+                    set_status("Renamed");
+            }
+            continue;
+        }
+
+        if ((ch == 'd' || ch == 'D') && p->count > 0) {
+            char full[PATH_LEN];
+            char question[STATUS_LEN];
+
+            path_join(full, p->path, p->entries[p->selected].name);
+            sprintf(question, "Delete %s ? (y/N)", p->entries[p->selected].name);
+
+            if (confirm_yes_no(question)) {
+                if (remove_tree(full) != 0)
+                    set_status("Delete failed");
+                else
+                    set_status("Deleted");
+            }
+            continue;
+        }
+
+        if ((ch == 'c' || ch == 'C' || ch == 'm' || ch == 'M') &&
+            p->count > 0) {
+            char src[PATH_LEN];
+            char dst[PATH_LEN];
+            int moving;
+
+            moving = (ch == 'm' || ch == 'M');
+            path_join(src, p->path, p->entries[p->selected].name);
+            path_join(dst, other->path, p->entries[p->selected].name);
+
+            if (path_exists(dst)) {
+                char question[STATUS_LEN];
+                sprintf(question, "Destination exists: overwrite/merge? (y/N)");
+                if (!confirm_yes_no(question))
+                    continue;
+            }
+
+            if (moving && rename(src, dst) == 0) {
+                set_status("Moved");
+            } else if (copy_tree(src, dst) == 0) {
+                if (moving) {
+                    if (remove_tree(src) != 0)
+                        set_status("Copied but could not remove source");
+                    else
+                        set_status("Moved");
+                } else {
+                    set_status("Copied");
+                }
+            } else {
+                set_status(moving ? "Move failed" : "Copy failed");
+            }
+
+            continue;
         }
     }
 }
@@ -3982,7 +4333,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 3");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 4");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
