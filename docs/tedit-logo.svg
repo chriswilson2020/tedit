@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 260" role="img" aria-labelledby="title desc">
+<title id="title">TEDIT</title>
+<desc id="desc">A terminal-green teddy bear wearing a command-line visor beside the TEDIT wordmark.</desc>
+<defs>
+  <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#63f6a7"/>
+    <stop offset="1" stop-color="#2edbb1"/>
+  </linearGradient>
+  <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur stdDeviation="3.2" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+</defs>
+<g fill="none" stroke="url(#g)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+  <path d="M88 87 C65 57 71 28 100 18 C127 9 150 25 164 48 C196 38 232 38 264 48 C278 25 301 9 328 18 C357 28 363 57 340 87 L350 160 C326 207 286 232 214 242 C142 232 102 207 78 160 Z"/>
+  <path d="M121 91 H307 Q325 91 322 111 L316 145 Q313 161 294 161 H134 Q115 161 112 145 L106 111 Q103 91 121 91 Z"/>
+</g>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-weight="800">
+  <text x="130" y="139" font-size="49" fill="#63f6a7">&gt;_</text>
+</g>
+<g stroke="#49dfc2" stroke-width="10" stroke-linecap="round">
+  <path d="M252 111 l-28 39"/><path d="M278 111 l-28 39"/>
+</g>
+<ellipse cx="214" cy="183" rx="48" ry="39" fill="#58e7aa"/>
+<path d="M195 175 Q214 158 233 175 Q225 190 214 190 Q203 190 195 175Z" fill="#0d0f10"/>
+<path d="M214 190 v13 M214 203 q-15 15 -30 0 M214 203 q15 15 30 0" fill="none" stroke="#0d0f10" stroke-width="7" stroke-linecap="round"/>
+<g fill="#63f6a7" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-weight="900" font-size="118" letter-spacing="10">
+  <text x="390" y="171">TEDIT</text>
+</g>
+</svg>
