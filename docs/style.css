@@ -158,3 +158,40 @@ footer {
   h1 { font-size: 44px; }
   .facts { gap: 12px; }
 }
+
+
+/* TEDIT teddy branding */
+.brand {
+  display: inline-flex;
+  align-items: center;
+}
+.brand-logo {
+  display: block;
+  width: 150px;
+  max-height: 42px;
+  object-fit: contain;
+  object-position: left center;
+  filter: drop-shadow(0 0 14px rgba(143,240,164,.14));
+}
+.hero-logo {
+  display: block;
+  width: min(420px, 92%);
+  height: auto;
+  margin: 0 0 22px;
+  filter: drop-shadow(0 0 22px rgba(143,240,164,.12));
+}
+.footer-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.footer-brand img {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 6px;
+}
+@media (max-width: 620px) {
+  .brand-logo { width: 122px; max-height: 36px; }
+  .hero-logo { width: min(330px, 96%); }
+}
