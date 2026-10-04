@@ -47,6 +47,10 @@
 #include "syntax.h"
 #include "format.h"
 
+#ifndef TEDIT_SYSTEM_SYNTAX_DIR
+#define TEDIT_SYSTEM_SYNTAX_DIR "/usr/local/share/tedit/syntax"
+#endif
+
 #define MAX_LINES   20000
 #define MAX_LINE    8192
 #define NAME_LEN    1024
@@ -471,8 +475,15 @@ static void load_syntax_definitions(void)
 
     syntax_init();
 
-    /* Lowest priority: normal installation location. */
-    syntax_load_dir("/usr/local/share/tedit/syntax");
+    /* Lowest priority: installation location selected at build time. */
+    syntax_load_dir(TEDIT_SYSTEM_SYNTAX_DIR);
+
+    /* Conventional per-user local install location. */
+    home = getenv("HOME");
+    if (home != NULL) {
+        sprintf(path, "%s/.local/share/tedit/syntax", home);
+        syntax_load_dir(path);
+    }
 
     /* Convenient when running directly from the source directory. */
     syntax_load_dir("./syntax");
@@ -483,7 +494,6 @@ static void load_syntax_definitions(void)
         syntax_load_dir(envdir);
 
     /* Highest priority: per-user definitions and overrides. */
-    home = getenv("HOME");
     if (home != NULL) {
         sprintf(path, "%s/.tedit/syntax", home);
         syntax_load_dir(path);
