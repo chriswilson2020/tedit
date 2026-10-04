@@ -1,0 +1,17 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux-c89:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install curses headers
+        run: sudo apt-get update && sudo apt-get install -y libncurses-dev
+      - name: Build as C89
+        run: |
+          make clean
+          make CC=gcc CFLAGS="-std=c89 -Wall -Wextra -pedantic"
