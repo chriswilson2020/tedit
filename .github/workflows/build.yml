@@ -16,6 +16,16 @@ jobs:
           make clean
           make CC=gcc CFLAGS="-std=c89 -Wall -Wextra -pedantic"
 
+      - name: Measure Linux binary
+        run: |
+          echo "Unstripped:"
+          ls -l tedit
+          size tedit
+          cp tedit tedit.stripped
+          strip tedit.stripped
+          echo "Stripped:"
+          ls -l tedit.stripped
+          size tedit.stripped
       - name: Create IRIX source tarball
         run: |
           mkdir -p dist/tedit-7.0.0-irix
