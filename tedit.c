@@ -128,6 +128,12 @@ enum {
     ACT_SELECT_WORD,
     ACT_SELECT_LINE,
     ACT_SELECT_ALL,
+    ACT_COLUMN_SELECT,
+    ACT_TABS_TO_SPACES,
+    ACT_SPACES_TO_TABS,
+    ACT_SORT_LINES,
+    ACT_TRANSPOSE_CHARS,
+    ACT_REPEAT_LAST,
     ACT_MATCH_BRACKET,
     ACT_BOOKMARK_TOGGLE,
     ACT_BOOKMARK_NEXT,
@@ -192,7 +198,9 @@ static int line_numbers = 1;
 static char syntax_dir_override[PATH_LEN];
 
 static int selecting = 0;
+static int column_selecting = 0;
 static int sel_sy = 0, sel_sx = 0;
+static int last_repeat_action = ACT_NONE;
 
 static char statusmsg[STATUS_LEN];
 static char last_search[SEARCH_LEN];
@@ -268,7 +276,14 @@ static const MenuItem edit_menu[] = {
     {"Lowercase", ACT_LOWERCASE},
     {"Select word", ACT_SELECT_WORD},
     {"Select line", ACT_SELECT_LINE},
-    {"Select all", ACT_SELECT_ALL}
+    {"Select all", ACT_SELECT_ALL},
+    {"Column select", ACT_COLUMN_SELECT},
+    {"----------------", ACT_NONE},
+    {"Tabs -> spaces", ACT_TABS_TO_SPACES},
+    {"Spaces -> tabs", ACT_SPACES_TO_TABS},
+    {"Sort selected lines", ACT_SORT_LINES},
+    {"Transpose chars", ACT_TRANSPOSE_CHARS},
+    {"Repeat last edit", ACT_REPEAT_LAST}
 };
 
 static const MenuItem search_menu[] = {
@@ -1550,6 +1565,7 @@ static void reset_edit_history(void)
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
     selecting = 0;
+    column_selecting = 0;
 }
 
 static int create_new_buffer(void)
@@ -2321,6 +2337,21 @@ static int pos_selected(int row, int col)
     if (!selecting)
         return 0;
 
+    if (column_selecting) {
+        int top;
+        int bottom;
+        int left;
+        int right;
+
+        top = sel_sy < cy ? sel_sy : cy;
+        bottom = sel_sy > cy ? sel_sy : cy;
+        left = sel_sx < cx ? sel_sx : cx;
+        right = sel_sx > cx ? sel_sx : cx;
+
+        return row >= top && row <= bottom &&
+               col >= left && col < right;
+    }
+
     normalize_selection(&sy, &sx, &ey, &ex);
 
     if (row < sy || row > ey)
@@ -2352,6 +2383,55 @@ static void copy_selection_or_line(void)
     int row;
     char *buf;
     int pos;
+
+    if (selecting && column_selecting) {
+        int top;
+        int bottom;
+        int left;
+        int right;
+        int row;
+        int size;
+        int pos;
+        char *buf;
+
+        top = sel_sy < cy ? sel_sy : cy;
+        bottom = sel_sy > cy ? sel_sy : cy;
+        left = sel_sx < cx ? sel_sx : cx;
+        right = sel_sx > cx ? sel_sx : cx;
+
+        size = (bottom - top + 1) * (right - left + 1) + 1;
+        buf = (char *)malloc(size);
+        if (buf == NULL) {
+            set_status("Out of memory");
+            return;
+        }
+
+        pos = 0;
+
+        for (row = top; row <= bottom; row++) {
+            int len;
+            int start;
+            int end;
+
+            len = (int)strlen(lines[row]);
+            start = left < len ? left : len;
+            end = right < len ? right : len;
+
+            if (end > start) {
+                memcpy(buf + pos, lines[row] + start, end - start);
+                pos += end - start;
+            }
+
+            if (row < bottom)
+                buf[pos++] = '\n';
+        }
+
+        buf[pos] = '\0';
+        set_clipboard_text(buf);
+        free(buf);
+        set_status("Column selection copied");
+        return;
+    }
 
     normalize_selection(&sy, &sx, &ey, &ex);
 
@@ -2407,6 +2487,47 @@ static void delete_selection(void)
 
     if (!selecting)
         return;
+
+    if (column_selecting) {
+        int top;
+        int bottom;
+        int left;
+        int right;
+        int row;
+
+        top = sel_sy < cy ? sel_sy : cy;
+        bottom = sel_sy > cy ? sel_sy : cy;
+        left = sel_sx < cx ? sel_sx : cx;
+        right = sel_sx > cx ? sel_sx : cx;
+
+        push_undo();
+
+        for (row = top; row <= bottom; row++) {
+            int len;
+            int start;
+            int end;
+
+            len = (int)strlen(lines[row]);
+            start = left < len ? left : len;
+            end = right < len ? right : len;
+
+            if (end > start)
+                memmove(lines[row] + start,
+                        lines[row] + end,
+                        len - end + 1);
+        }
+
+        cy = top;
+        cx = left;
+        if (cx > (int)strlen(lines[cy]))
+            cx = (int)strlen(lines[cy]);
+
+        selecting = 0;
+        column_selecting = 0;
+        modified = 1;
+        set_status("Column selection deleted");
+        return;
+    }
 
     normalize_selection(&sy, &sx, &ey, &ex);
 
@@ -2807,6 +2928,226 @@ static void insert_typed_char(int ch)
 }
 
 
+static void toggle_column_selection(void)
+{
+    if (selecting && column_selecting) {
+        selecting = 0;
+        column_selecting = 0;
+        set_status("Column selection cleared");
+        return;
+    }
+
+    selecting = 1;
+    column_selecting = 1;
+    sel_sy = cy;
+    sel_sx = cx;
+    set_status("Column selection started");
+}
+
+static void tabs_to_spaces(void)
+{
+    int start;
+    int end;
+    int row;
+
+    selected_line_range(&start, &end);
+    push_undo();
+
+    for (row = start; row <= end; row++) {
+        const char *old;
+        char *p;
+        int i;
+        int col;
+        int outlen;
+
+        old = lines[row];
+        outlen = 0;
+        col = 0;
+
+        for (i = 0; old[i] != '\0'; i++) {
+            if (old[i] == '\t') {
+                int n;
+                n = tab_width - (col % tab_width);
+                outlen += n;
+                col += n;
+            } else {
+                outlen++;
+                col++;
+            }
+        }
+
+        if (outlen >= MAX_LINE)
+            continue;
+
+        p = (char *)malloc(outlen + 1);
+        if (p == NULL)
+            continue;
+
+        outlen = 0;
+        col = 0;
+
+        for (i = 0; old[i] != '\0'; i++) {
+            if (old[i] == '\t') {
+                int n;
+                int j;
+                n = tab_width - (col % tab_width);
+                for (j = 0; j < n; j++)
+                    p[outlen++] = ' ';
+                col += n;
+            } else {
+                p[outlen++] = old[i];
+                col++;
+            }
+        }
+
+        p[outlen] = '\0';
+        free(lines[row]);
+        lines[row] = p;
+    }
+
+    modified = 1;
+    set_status("Tabs converted to spaces");
+}
+
+static void spaces_to_tabs(void)
+{
+    int start;
+    int end;
+    int row;
+
+    selected_line_range(&start, &end);
+    push_undo();
+
+    for (row = start; row <= end; row++) {
+        char *old;
+        char *p;
+        int lead;
+        int tabs;
+        int spaces;
+        int rest;
+        int outlen;
+        int i;
+
+        old = lines[row];
+        lead = 0;
+
+        while (old[lead] == ' ')
+            lead++;
+
+        tabs = lead / tab_width;
+        spaces = lead % tab_width;
+        rest = (int)strlen(old + lead);
+        outlen = tabs + spaces + rest;
+
+        p = (char *)malloc(outlen + 1);
+        if (p == NULL)
+            continue;
+
+        outlen = 0;
+        for (i = 0; i < tabs; i++)
+            p[outlen++] = '\t';
+        for (i = 0; i < spaces; i++)
+            p[outlen++] = ' ';
+
+        strcpy(p + outlen, old + lead);
+
+        free(lines[row]);
+        lines[row] = p;
+    }
+
+    modified = 1;
+    set_status("Leading spaces converted to tabs");
+}
+
+static int line_ptr_cmp(const void *a, const void *b)
+{
+    const char * const *sa;
+    const char * const *sb;
+
+    sa = (const char * const *)a;
+    sb = (const char * const *)b;
+    return strcmp(*sa, *sb);
+}
+
+static void sort_selected_lines(void)
+{
+    int start;
+    int end;
+
+    selected_line_range(&start, &end);
+
+    if (end <= start) {
+        set_status("Select more than one line to sort");
+        return;
+    }
+
+    push_undo();
+    qsort(&lines[start], end - start + 1, sizeof(char *), line_ptr_cmp);
+    modified = 1;
+    set_status("Selected lines sorted");
+}
+
+static void transpose_chars(void)
+{
+    int len;
+    int a;
+    int b;
+    char tmp;
+
+    len = (int)strlen(lines[cy]);
+
+    if (len < 2) {
+        set_status("Nothing to transpose");
+        return;
+    }
+
+    if (cx <= 0) {
+        a = 0;
+        b = 1;
+    } else if (cx >= len) {
+        a = len - 2;
+        b = len - 1;
+    } else {
+        a = cx - 1;
+        b = cx;
+    }
+
+    push_undo();
+    tmp = lines[cy][a];
+    lines[cy][a] = lines[cy][b];
+    lines[cy][b] = tmp;
+
+    if (cx < len)
+        cx++;
+
+    modified = 1;
+    set_status("Characters transposed");
+}
+
+static int repeatable_action(int action)
+{
+    switch (action) {
+    case ACT_INDENT:
+    case ACT_UNINDENT:
+    case ACT_COMMENT:
+    case ACT_DUP_LINE:
+    case ACT_DELETE_LINE:
+    case ACT_MOVE_LINE_UP:
+    case ACT_MOVE_LINE_DOWN:
+    case ACT_JOIN_LINE:
+    case ACT_TRIM_WS:
+    case ACT_UPPERCASE:
+    case ACT_LOWERCASE:
+    case ACT_TABS_TO_SPACES:
+    case ACT_SPACES_TO_TABS:
+    case ACT_SORT_LINES:
+    case ACT_TRANSPOSE_CHARS:
+        return 1;
+    }
+
+    return 0;
+}
+
 static void duplicate_line(void)
 {
     int i;
@@ -3033,6 +3374,7 @@ static void select_current_word(void)
     }
 
     selecting = 1;
+    column_selecting = 0;
     sel_sy = cy;
     sel_sx = start;
     cx = end;
@@ -3042,6 +3384,7 @@ static void select_current_word(void)
 static void select_current_line(void)
 {
     selecting = 1;
+    column_selecting = 0;
     sel_sy = cy;
     sel_sx = 0;
     cx = (int)strlen(lines[cy]);
@@ -3051,6 +3394,7 @@ static void select_current_line(void)
 static void select_all_text(void)
 {
     selecting = 1;
+    column_selecting = 0;
     sel_sy = 0;
     sel_sx = 0;
     cy = nlines - 1;
@@ -3598,7 +3942,7 @@ static void draw_screen(void)
             name_room, name_room,
             filename[0] ? filename : "[No Name]",
             modified ? "[+]" : "",
-            selecting ? "[SEL]" : "",
+            selecting ? (column_selecting ? "[COL]" : "[SEL]") : "",
             syntax_enabled ? syntax_name() : "TEXT",
             cy + 1, nlines, cx + 1, tab_width);
 
@@ -4737,7 +5081,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 5");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 6");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -4832,6 +5176,9 @@ static void quit_editor(void)
 
 static void execute_action(int action)
 {
+    if (action != ACT_REPEAT_LAST && repeatable_action(action))
+        last_repeat_action = action;
+
     switch (action) {
     case ACT_NEW_BUFFER:
         create_new_buffer();
@@ -4851,6 +5198,7 @@ static void execute_action(int action)
     case ACT_REDO: do_redo(); break;
     case ACT_SELECT:
         selecting = !selecting;
+        column_selecting = 0;
         if (selecting) {
             sel_sy = cy; sel_sx = cx;
             set_status("Selection started");
@@ -4877,6 +5225,17 @@ static void execute_action(int action)
     case ACT_SELECT_WORD: select_current_word(); break;
     case ACT_SELECT_LINE: select_current_line(); break;
     case ACT_SELECT_ALL: select_all_text(); break;
+    case ACT_COLUMN_SELECT: toggle_column_selection(); break;
+    case ACT_TABS_TO_SPACES: tabs_to_spaces(); break;
+    case ACT_SPACES_TO_TABS: spaces_to_tabs(); break;
+    case ACT_SORT_LINES: sort_selected_lines(); break;
+    case ACT_TRANSPOSE_CHARS: transpose_chars(); break;
+    case ACT_REPEAT_LAST:
+        if (last_repeat_action != ACT_NONE)
+            execute_action(last_repeat_action);
+        else
+            set_status("No repeatable edit yet");
+        break;
     case ACT_MATCH_BRACKET: goto_matching_bracket(); break;
     case ACT_BOOKMARK_TOGGLE: toggle_bookmark(); break;
     case ACT_BOOKMARK_NEXT: next_bookmark(); break;
@@ -5336,6 +5695,7 @@ static void process_key(int ch)
 
     case CTRL_KEY('b'):
         selecting = !selecting;
+        column_selecting = 0;
         if (selecting) {
             sel_sy = cy;
             sel_sx = cx;
