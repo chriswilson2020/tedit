@@ -293,6 +293,11 @@ static char *dupstr(const char *s)
     return p;
 }
 
+static int prompt_input(const char *prompt, char *out, int outlen);
+static void path_parent(char *path);
+static int file_browser(char *out, int outlen);
+static int load_file(const char *name);
+
 static void set_status(const char *s)
 {
     strncpy(statusmsg, s, STATUS_LEN - 1);
