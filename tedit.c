@@ -84,6 +84,14 @@ extern int pclose(FILE *stream);
 #define CP_SELECT   11
 #define CP_MATCH    12
 
+#define EOL_LF      0
+#define EOL_CRLF    1
+#define EOL_CR      2
+
+#define ENC_ASCII   0
+#define ENC_UTF8    1
+#define ENC_8BIT    2
+
 typedef struct {
     char **cap_lines;
     int cap_nlines;
@@ -178,6 +186,9 @@ enum {
     ACT_TAB2,
     ACT_TAB4,
     ACT_TAB8,
+    ACT_EOL_LF,
+    ACT_EOL_CRLF,
+    ACT_EOL_CR,
     ACT_HELP,
     ACT_ABOUT
 };
@@ -188,6 +199,8 @@ typedef struct {
     int cursor_y, cursor_x;
     int row_offset, col_offset;
     int dirty;
+    int eol_mode;
+    int encoding;
     char fname[NAME_LEN];
 } Buffer;
 
@@ -203,6 +216,8 @@ static unsigned char bookmarks[MAX_BUFFERS][MAX_LINES];
 #define rowoff   (buffers[curbuf].row_offset)
 #define coloff   (buffers[curbuf].col_offset)
 #define modified (buffers[curbuf].dirty)
+#define eol_mode (buffers[curbuf].eol_mode)
+#define encoding (buffers[curbuf].encoding)
 #define filename (buffers[curbuf].fname)
 
 static int tab_width = 4;
@@ -339,7 +354,10 @@ static const MenuItem options_menu[] = {
     {"Toggle auto-pairs", ACT_TOGGLE_AUTOPAIRS},
     {"Tab width: 2", ACT_TAB2},
     {"Tab width: 4", ACT_TAB4},
-    {"Tab width: 8", ACT_TAB8}
+    {"Tab width: 8", ACT_TAB8},
+    {"Line endings: LF", ACT_EOL_LF},
+    {"Line endings: CRLF", ACT_EOL_CRLF},
+    {"Line endings: CR", ACT_EOL_CR}
 };
 
 static const MenuItem help_menu[] = {
@@ -1559,6 +1577,8 @@ static void init_buffer(void)
     cy = cx = 0;
     rowoff = coloff = 0;
     modified = 0;
+    eol_mode = EOL_LF;
+    encoding = ENC_ASCII;
     filename[0] = '\0';
     memset(bookmarks[curbuf], 0, MAX_LINES);
 }
@@ -2148,13 +2168,102 @@ static void load_config(void)
 }
 
 
+static const char *eol_name(void)
+{
+    switch (eol_mode) {
+    case EOL_CRLF: return "CRLF";
+    case EOL_CR:   return "CR";
+    default:       return "LF";
+    }
+}
+
+static const char *encoding_name(void)
+{
+    switch (encoding) {
+    case ENC_UTF8: return "UTF-8";
+    case ENC_8BIT: return "8BIT";
+    default:       return "ASCII";
+    }
+}
+
+static int utf8_valid_bytes(const unsigned char *s)
+{
+    int i;
+
+    i = 0;
+
+    while (s[i] != '\0') {
+        unsigned char c;
+
+        c = s[i];
+
+        if (c < 0x80) {
+            i++;
+        } else if ((c & 0xe0) == 0xc0) {
+            if ((s[i + 1] & 0xc0) != 0x80 || c < 0xc2)
+                return 0;
+            i += 2;
+        } else if ((c & 0xf0) == 0xe0) {
+            if ((s[i + 1] & 0xc0) != 0x80 ||
+                (s[i + 2] & 0xc0) != 0x80)
+                return 0;
+            i += 3;
+        } else if ((c & 0xf8) == 0xf0) {
+            if ((s[i + 1] & 0xc0) != 0x80 ||
+                (s[i + 2] & 0xc0) != 0x80 ||
+                (s[i + 3] & 0xc0) != 0x80 ||
+                c > 0xf4)
+                return 0;
+            i += 4;
+        } else {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void detect_buffer_encoding(void)
+{
+    int row;
+    int high;
+    int valid;
+
+    high = 0;
+    valid = 1;
+
+    for (row = 0; row < nlines; row++) {
+        const unsigned char *p;
+
+        p = (const unsigned char *)lines[row];
+
+        while (*p) {
+            if (*p >= 0x80)
+                high = 1;
+            p++;
+        }
+
+        if (!utf8_valid_bytes((const unsigned char *)lines[row]))
+            valid = 0;
+    }
+
+    if (!high)
+        encoding = ENC_ASCII;
+    else if (valid)
+        encoding = ENC_UTF8;
+    else
+        encoding = ENC_8BIT;
+}
+
 static int load_file(const char *name)
 {
     FILE *fp;
     char buf[MAX_LINE];
-    int len;
+    int pos;
+    int ch;
+    int detected_eol;
 
-    fp = fopen(name, "r");
+    fp = fopen(name, "rb");
 
     if (fp == NULL) {
         free_buffer();
@@ -2165,10 +2274,14 @@ static int load_file(const char *name)
         filename[NAME_LEN - 1] = '\0';
 
         modified = 0;
+        eol_mode = EOL_LF;
+        encoding = ENC_ASCII;
         cy = cx = rowoff = coloff = 0;
         selecting = 0;
+        column_selecting = 0;
         clear_stack(undo_stack, &undo_count);
         clear_stack(redo_stack, &redo_count);
+        free_capture(&pending_undo);
 
         recent_add(filename);
         sprintf(statusmsg, "New file: %s", filename);
@@ -2177,40 +2290,76 @@ static int load_file(const char *name)
 
     free_buffer();
     nlines = 0;
+    pos = 0;
+    detected_eol = -1;
 
-    while (fgets(buf, sizeof(buf), fp) != NULL && nlines < MAX_LINES) {
-        len = (int)strlen(buf);
+    while ((ch = fgetc(fp)) != EOF && nlines < MAX_LINES) {
+        if (ch == '\r' || ch == '\n') {
+            int this_eol;
 
-        while (len > 0 &&
-              (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-            buf[len - 1] = '\0';
-            len--;
+            if (ch == '\r') {
+                int next;
+
+                next = fgetc(fp);
+
+                if (next == '\n') {
+                    this_eol = EOL_CRLF;
+                } else {
+                    this_eol = EOL_CR;
+                    if (next != EOF)
+                        ungetc(next, fp);
+                }
+            } else {
+                this_eol = EOL_LF;
+            }
+
+            if (detected_eol < 0)
+                detected_eol = this_eol;
+
+            buf[pos] = '\0';
+            lines[nlines] = dupstr(buf);
+
+            if (lines[nlines] == NULL) {
+                fclose(fp);
+                set_status("Out of memory while loading");
+                return -1;
+            }
+
+            nlines++;
+            pos = 0;
+        } else if (pos < MAX_LINE - 1) {
+            buf[pos++] = (char)ch;
         }
+    }
 
+    if (pos > 0 || nlines == 0) {
+        buf[pos] = '\0';
         lines[nlines] = dupstr(buf);
+
         if (lines[nlines] == NULL) {
             fclose(fp);
             set_status("Out of memory while loading");
             return -1;
         }
+
         nlines++;
     }
 
     fclose(fp);
 
-    if (nlines == 0) {
-        lines[0] = dupstr("");
-        nlines = 1;
-    }
-
     strncpy(filename, name, NAME_LEN - 1);
     filename[NAME_LEN - 1] = '\0';
 
     modified = 0;
+    eol_mode = detected_eol >= 0 ? detected_eol : EOL_LF;
+    detect_buffer_encoding();
+
     cy = cx = rowoff = coloff = 0;
     selecting = 0;
+    column_selecting = 0;
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
+    free_capture(&pending_undo);
 
     recent_add(filename);
     sprintf(statusmsg, "Loaded %s", filename);
@@ -2233,8 +2382,15 @@ static int save_file_as(const char *name)
 
     for (i = 0; i < nlines; i++) {
         fputs(lines[i], fp);
-        if (i < nlines - 1)
-            fputc('\n', fp);
+
+        if (i < nlines - 1) {
+            if (eol_mode == EOL_CRLF)
+                fputs("\r\n", fp);
+            else if (eol_mode == EOL_CR)
+                fputc('\r', fp);
+            else
+                fputc('\n', fp);
+        }
     }
 
     fclose(fp);
@@ -4173,12 +4329,13 @@ static void draw_screen(void)
     if (name_room < 10)
         name_room = 10;
 
-    sprintf(buf, " %-*.*s %s %s %s Ln %d/%d Col %d TAB:%d ",
+    sprintf(buf, " %-*.*s %s %s %s %s/%s Ln %d/%d Col %d TAB:%d ",
             name_room, name_room,
             filename[0] ? filename : "[No Name]",
             modified ? "[+]" : "",
             selecting ? (column_selecting ? "[COL]" : "[SEL]") : "",
             syntax_enabled ? syntax_name() : "TEXT",
+            encoding_name(), eol_name(),
             cy + 1, nlines, cx + 1, tab_width);
 
     mvaddnstr(status_y, 0, buf, COLS);
@@ -5316,7 +5473,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 7");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 8");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -5521,6 +5678,12 @@ static void execute_action(int action)
         tab_width = 4; set_status("Tab width 4"); break;
     case ACT_TAB8:
         tab_width = 8; set_status("Tab width 8"); break;
+    case ACT_EOL_LF:
+        eol_mode = EOL_LF; modified = 1; set_status("Line endings: LF"); break;
+    case ACT_EOL_CRLF:
+        eol_mode = EOL_CRLF; modified = 1; set_status("Line endings: CRLF"); break;
+    case ACT_EOL_CR:
+        eol_mode = EOL_CR; modified = 1; set_status("Line endings: CR"); break;
     case ACT_HELP: help_screen(); break;
     case ACT_ABOUT: about_screen(); break;
     default: break;
