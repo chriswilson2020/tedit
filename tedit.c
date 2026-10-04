@@ -757,6 +757,10 @@ static void save_session(void)
         return;
 
     fprintf(fp, "current=%d\n", curbuf);
+    fprintf(fp, "split=%d\n", split_enabled);
+    fprintf(fp, "split_other=%d\n", split_other);
+    fprintf(fp, "symbols=%d\n", symbol_sidebar_enabled);
+    fprintf(fp, "output=%d\n", output_visible);
 
     for (bi = 0; bi < buffer_count; bi++) {
         if (buffers[bi].fname[0] != '\0')
@@ -776,6 +780,11 @@ static void restore_session(void)
     char line[PATH_LEN + 64];
     FILE *fp;
     int loaded;
+    int desired_current;
+    int desired_split;
+    int desired_split_other;
+    int desired_symbols;
+    int desired_output;
 
     if (!session_enabled)
         return;
@@ -790,8 +799,34 @@ static void restore_session(void)
         return;
 
     loaded = 0;
+    desired_current = 0;
+    desired_split = 0;
+    desired_split_other = -1;
+    desired_symbols = 0;
+    desired_output = 0;
 
     while (fgets(line, sizeof(line), fp) != NULL) {
+        if (!strncmp(line, "current=", 8)) {
+            desired_current = atoi(line + 8);
+            continue;
+        }
+        if (!strncmp(line, "split=", 6)) {
+            desired_split = atoi(line + 6);
+            continue;
+        }
+        if (!strncmp(line, "split_other=", 12)) {
+            desired_split_other = atoi(line + 12);
+            continue;
+        }
+        if (!strncmp(line, "symbols=", 8)) {
+            desired_symbols = atoi(line + 8);
+            continue;
+        }
+        if (!strncmp(line, "output=", 7)) {
+            desired_output = atoi(line + 7);
+            continue;
+        }
+
         if (!strncmp(line, "file=", 5)) {
             char *name;
             char *t1;
@@ -831,10 +866,13 @@ static void restore_session(void)
 
             load_file(name);
             cy = sy;
-            if (cy < 0) cy = 0;
-            if (cy >= nlines) cy = nlines - 1;
+            if (cy < 0)
+                cy = 0;
+            if (cy >= nlines)
+                cy = nlines - 1;
             cx = sx;
-            if (cx < 0) cx = 0;
+            if (cx < 0)
+                cx = 0;
             if (cx > (int)strlen(lines[cy]))
                 cx = (int)strlen(lines[cy]);
 
@@ -845,7 +883,28 @@ static void restore_session(void)
     fclose(fp);
 
     if (loaded > 0) {
-        curbuf = 0;
+        if (desired_current >= 0 && desired_current < buffer_count)
+            curbuf = desired_current;
+        else
+            curbuf = 0;
+
+        symbol_sidebar_enabled = desired_symbols ? 1 : 0;
+        output_visible = desired_output ? 1 : 0;
+
+        if (desired_split && buffer_count > 1) {
+            split_enabled = 1;
+
+            if (desired_split_other >= 0 &&
+                desired_split_other < buffer_count &&
+                desired_split_other != curbuf)
+                split_other = desired_split_other;
+            else
+                split_other = (curbuf + 1) % buffer_count;
+        } else {
+            split_enabled = 0;
+            split_other = -1;
+        }
+
         set_status("Session restored");
     }
 }
@@ -1174,10 +1233,10 @@ static void switch_split_pane(void)
         return;
     }
 
+    reset_edit_history();
     tmp = curbuf;
     curbuf = split_other;
     split_other = tmp;
-    reset_edit_history();
     selecting = 0;
     scroll_screen();
     set_status("Switched split pane");
@@ -1713,10 +1772,10 @@ static int create_new_buffer(void)
         return 0;
     }
 
+    reset_edit_history();
     curbuf = buffer_count;
     buffer_count++;
     init_buffer();
-    reset_edit_history();
     set_status("New buffer");
     return 1;
 }
@@ -1728,6 +1787,7 @@ static void switch_buffer(int dir)
         return;
     }
 
+    reset_edit_history();
     curbuf += dir;
 
     if (curbuf < 0)
@@ -1735,7 +1795,6 @@ static void switch_buffer(int dir)
     if (curbuf >= buffer_count)
         curbuf = 0;
 
-    reset_edit_history();
 
     sprintf(statusmsg, "Buffer %d/%d: %s",
             curbuf + 1, buffer_count,
@@ -1762,11 +1821,11 @@ static void close_current_buffer(void)
         }
     }
 
+    reset_edit_history();
     free_buffer_index(curbuf);
 
     if (buffer_count == 1) {
         init_buffer();
-        reset_edit_history();
         set_status("New empty buffer");
         return;
     }
@@ -1783,7 +1842,6 @@ static void close_current_buffer(void)
     if (curbuf >= buffer_count)
         curbuf = buffer_count - 1;
 
-    reset_edit_history();
     sprintf(statusmsg, "Closed buffer; now %d/%d", curbuf + 1, buffer_count);
 }
 
@@ -2358,6 +2416,7 @@ static int load_file(const char *name)
     fp = fopen(name, "rb");
 
     if (fp == NULL) {
+        reset_edit_history();
         free_buffer();
         lines[0] = dupstr("");
         nlines = 1;
@@ -2371,15 +2430,12 @@ static int load_file(const char *name)
         cy = cx = rowoff = coloff = 0;
         selecting = 0;
         column_selecting = 0;
-        clear_stack(undo_stack, &undo_count);
-        clear_stack(redo_stack, &redo_count);
-        free_capture(&pending_undo);
-
         recent_add(filename);
         sprintf(statusmsg, "New file: %s", filename);
         return 0;
     }
 
+    reset_edit_history();
     free_buffer();
     nlines = 0;
     pos = 0;
@@ -2449,10 +2505,6 @@ static int load_file(const char *name)
     cy = cx = rowoff = coloff = 0;
     selecting = 0;
     column_selecting = 0;
-    clear_stack(undo_stack, &undo_count);
-    clear_stack(redo_stack, &redo_count);
-    free_capture(&pending_undo);
-
     recent_add(filename);
     sprintf(statusmsg, "Loaded %s", filename);
 
@@ -5565,7 +5617,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 9");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 10");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -6184,8 +6236,8 @@ static void process_key(int ch)
 
                         if (ev.x >= bx && ev.x < bx + width) {
                             if (mi != curbuf) {
-                                curbuf = mi;
                                 reset_edit_history();
+                                curbuf = mi;
                                 selecting = 0;
                             }
                             return;
