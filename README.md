@@ -28,67 +28,114 @@ Run from the source directory with:
 INSTALLATION
 ------------
 
-System-wide installation for all users:
+### Quick start (personal install)
 
-  make
-  make install
+If you do not have administrator/root access:
 
-The default prefix is /usr/local, producing:
+    make
+    make install-user
 
-  /usr/local/bin/tedit
-  /usr/local/share/tedit/syntax/*.conf
-  /usr/local/share/tedit/teditrc.example
+This installs:
 
-On systems requiring administrator privileges, run the install command through
-the system's normal privilege mechanism, for example su or sudo.
+    ~/.local/bin/tedit
+    ~/.local/share/tedit/syntax/*.conf
+    ~/.local/share/tedit/teditrc.example
 
-Personal installation without administrator access:
+Make sure ~/.local/bin is on your PATH.
 
-  make
-  make install-user
+For sh/bash/ksh:
 
-This installs to:
+    export PATH="$HOME/.local/bin:$PATH"
 
-  ~/.local/bin/tedit
-  ~/.local/share/tedit/syntax/*.conf
-  ~/.local/share/tedit/teditrc.example
+For csh/tcsh:
 
-Make sure ~/.local/bin is on PATH.
+    set path = ( $HOME/.local/bin $path )
 
-A custom prefix is also supported:
+You can then run:
 
-  make clean
-  make PREFIX=/opt/tedit
-  make install PREFIX=/opt/tedit
+    tedit
 
-The selected syntax directory is compiled into TEDIT, so when changing PREFIX
-for a build, use the same PREFIX for both make and make install.
+### Install into ~/bin instead
 
-PACKAGING / DESTDIR
--------------------
-DESTDIR is supported for package staging without changing the runtime prefix:
+If you already use ~/bin and want TEDIT there:
 
-  make
-  make install DESTDIR=/tmp/tedit-package
+    make
+    make install PREFIX=$HOME
 
-With the default PREFIX this stages files under:
+This installs:
 
-  /tmp/tedit-package/usr/local/bin
-  /tmp/tedit-package/usr/local/share/tedit
+    ~/bin/tedit
+    ~/share/tedit/syntax/*.conf
+    ~/share/tedit/teditrc.example
 
-UNINSTALL
----------
-Remove only the files shipped by TEDIT:
+Make sure ~/bin is on your PATH.
 
-  make uninstall
+### System-wide install
+
+For all users on the machine:
+
+    make
+    sudo make install
+
+or, on systems without sudo:
+
+    su
+    make install
+    exit
+
+The default system install location is:
+
+    /usr/local/bin/tedit
+    /usr/local/share/tedit/syntax/*.conf
+    /usr/local/share/tedit/teditrc.example
+
+If you run `make install` without sufficient permissions, you may see an error such as:
+
+    mkdir: cannot create directory '/usr/local/share/tedit': Permission denied
+
+In that case use `make install-user`, `make install PREFIX=$HOME`, or run the system install with the appropriate administrator privileges.
+
+### Custom prefix
+
+To install somewhere else:
+
+    make clean
+    make PREFIX=/opt/tedit
+    make install PREFIX=/opt/tedit
+
+Use the same PREFIX for both build and install because TEDIT compiles the system syntax path into the binary.
+
+### Package staging with DESTDIR
+
+For packaging:
+
+    make
+    make install DESTDIR=/tmp/tedit-package
+
+With the default PREFIX this creates:
+
+    /tmp/tedit-package/usr/local/bin/tedit
+    /tmp/tedit-package/usr/local/share/tedit/syntax/
+
+### Uninstall
+
+For a default system install:
+
+    make uninstall
 
 For a custom prefix:
 
-  make uninstall PREFIX=/opt/tedit
+    make uninstall PREFIX=/opt/tedit
 
-The uninstall target removes TEDIT's known syntax files individually rather
-than deleting every .conf file in the syntax directory, so locally-added
-language definitions are left alone.
+For a personal ~/.local install:
+
+    make uninstall PREFIX=$HOME/.local
+
+For a ~/bin-style install:
+
+    make uninstall PREFIX=$HOME
+
+The uninstall target removes only TEDIT's own installed files and shipped syntax definitions.
 
 MULTIUSER CONFIGURATION
 -----------------------
