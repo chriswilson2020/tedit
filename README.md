@@ -1,36 +1,90 @@
-TEDIT v6.0.2 - modular classic-UNIX curses editor
-================================================
+# TEDIT 7.0
 
-TEDIT is a lightweight curses editor aimed at classic UNIX systems as well as
-modern BSD/Linux machines. Syntax highlighting and basic formatting rules are
-loaded from external language definition files rather than hard-coded into the
-editor.
+TEDIT is a small, conventional, menu-driven programmer's editor for classic
+UNIX and modern Unix-like systems. It is deliberately written in portable C
+and plain curses, with an ANSI syntax-colour fallback for systems such as IRIX
+where old curses libraries may report no colour support even though the
+terminal can display it.
 
-SOURCE LAYOUT
--------------
-  tedit.c          editor/UI/buffers/file browser
-  syntax.c/.h      language-definition loader + generic lexer
-  format.c/.h      generic comment/indent formatting rules
-  syntax/*.conf    language definitions
-  Makefile         portable build/install rules
-  teditrc.example  example per-user configuration
+It is intended to sit somewhere between nano/JOE/mcedit and a full IDE:
+familiar editing, real menus, project/build tools, multiple buffers and
+programming features, without requiring ncurses-specific APIs, C++, Rust,
+Python, Lua or a plugin runtime.
 
-BUILD
------
-  make
+## Highlights
 
-On IRIX the compiler may print its usual MIPSpro licence message. If object
-files are produced and the final link succeeds, TEDIT is built.
+- real pull-down menus; shortcuts continue to work while a menu is open
+- visible multi-buffer tabs and up to 8 open buffers
+- close-buffer and unsaved-change protection
+- split-buffer view
+- Curses/ANSI syntax highlighting driven by external configuration files
+- modular indentation and comment rules
+- syntax definitions for C/C++/headers, Python, shell, Makefile, Perl,
+  Fortran, Ada, JSON, Rust, Go, JavaScript and TypeScript
+- smart indentation and optional auto-pairs
+- incremental search, replace and goto-line
+- project-wide find-in-files
+- project root detection and project file browser
+- Build, Clean and Run commands with captured output
+- navigable compiler/search output: choose a result and press Enter to jump
+  to file and line
+- function/symbol sidebar and navigable symbol list
+- dual-pane MC-style file navigator
+- file navigator copy/move/delete/rename/mkdir
+- hidden-file toggle, name/size/date sorting, quick path and directory bookmarks
+- recent files
+- operation-based line-patch undo/redo rather than a stack of complete buffers
+- linear and rectangular/column selections
+- cut/copy/paste
+- duplicate/delete/move/join line
+- indent/unindent and comment/uncomment blocks
+- tabs-to-spaces and leading-spaces-to-tabs
+- uppercase/lowercase, sort selected lines, transpose characters
+- select word/line/all and repeat last editing command
+- bracket matching and jump-to-matching-bracket
+- line bookmarks
+- session restore
+- timed crash-recovery snapshots
+- optional backup files using the traditional `file~` convention
+- LF, CRLF and CR line-ending detection/preservation/conversion
+- ASCII / UTF-8 / arbitrary 8-bit text detection
+- optional mouse support when the curses implementation supplies it
+- preserves keyboard-only operation on old systems
 
-Run from the source directory with:
-  ./tedit
+## Build
 
-INSTALLATION
-------------
+The normal build is:
 
-### Quick start (personal install)
+    make
 
-If you do not have administrator/root access:
+Or directly:
+
+    cc -c syntax.c
+    cc -c format.c
+    cc -c tedit.c
+    cc -o tedit tedit.o syntax.o format.o -lcurses
+
+The repository CI builds with GCC in strict C89 mode.
+
+### IRIX
+
+TEDIT is intentionally compatible with the old curses interface used on IRIX.
+The syntax highlighter uses ANSI escape sequences for colour when IRIX curses
+does not provide curses colour support.
+
+Some MIPSpro installations print an old FlexLM licence message during
+compilation even when compilation continues successfully. The useful test is
+whether the object files and final `tedit` binary are produced.
+
+If your system discourages compiling on an NFS-mounted home directory, copy the
+source tree to a local temporary directory, build there, then install/copy the
+result.
+
+## Installation
+
+### Personal installation
+
+Without administrator access:
 
     make
     make install-user
@@ -40,8 +94,9 @@ This installs:
     ~/.local/bin/tedit
     ~/.local/share/tedit/syntax/*.conf
     ~/.local/share/tedit/teditrc.example
+    ~/.local/share/tedit/tedit-project.example
 
-Make sure ~/.local/bin is on your PATH.
+Make sure `~/.local/bin` is on PATH.
 
 For sh/bash/ksh:
 
@@ -51,192 +106,191 @@ For csh/tcsh:
 
     set path = ( $HOME/.local/bin $path )
 
-You can then run:
+### Install into ~/bin
 
-    tedit
-
-### Install into ~/bin instead
-
-If you already use ~/bin and want TEDIT there:
+If you already use `~/bin`:
 
     make
     make install PREFIX=$HOME
 
-This installs:
+This produces:
 
     ~/bin/tedit
     ~/share/tedit/syntax/*.conf
     ~/share/tedit/teditrc.example
+    ~/share/tedit/tedit-project.example
 
-Make sure ~/bin is on your PATH.
+### System-wide installation
 
-### System-wide install
-
-For all users on the machine:
+For all users:
 
     make
     sudo make install
 
-or, on systems without sudo:
+or on a traditional system without sudo:
 
     su
     make install
     exit
 
-The default system install location is:
+The default installation is:
 
     /usr/local/bin/tedit
     /usr/local/share/tedit/syntax/*.conf
     /usr/local/share/tedit/teditrc.example
+    /usr/local/share/tedit/tedit-project.example
 
-If you run `make install` without sufficient permissions, you may see an error such as:
+If `make install` reports a permission error under `/usr/local`, use
+`make install-user`, install with `PREFIX=$HOME`, or perform the system
+install with administrator privileges.
 
-    mkdir: cannot create directory '/usr/local/share/tedit': Permission denied
+### Custom prefix and packaging
 
-In that case use `make install-user`, `make install PREFIX=$HOME`, or run the system install with the appropriate administrator privileges.
-
-### Custom prefix
-
-To install somewhere else:
+Use the same PREFIX for build and install because the system syntax directory
+is compiled into TEDIT:
 
     make clean
     make PREFIX=/opt/tedit
     make install PREFIX=/opt/tedit
 
-Use the same PREFIX for both build and install because TEDIT compiles the system syntax path into the binary.
-
-### Package staging with DESTDIR
-
-For packaging:
+DESTDIR is supported:
 
     make
     make install DESTDIR=/tmp/tedit-package
 
-With the default PREFIX this creates:
-
-    /tmp/tedit-package/usr/local/bin/tedit
-    /tmp/tedit-package/usr/local/share/tedit/syntax/
-
 ### Uninstall
-
-For a default system install:
 
     make uninstall
 
-For a custom prefix:
-
-    make uninstall PREFIX=/opt/tedit
-
-For a personal ~/.local install:
+For a user install:
 
     make uninstall PREFIX=$HOME/.local
 
-For a ~/bin-style install:
+For a `~/bin` style install:
 
     make uninstall PREFIX=$HOME
 
-The uninstall target removes only TEDIT's own installed files and shipped syntax definitions.
+## User configuration
 
-MULTIUSER CONFIGURATION
------------------------
-A system install requires no per-user files. Every user can run TEDIT using the
-shared binary and shared syntax definitions immediately.
+TEDIT works without a user configuration file. To customise it, copy the
+example to `~/.teditrc`.
 
-Users may optionally create:
+Typical configuration:
 
-  ~/.teditrc
-  ~/.tedit/syntax/*.conf
+    tabwidth=4
+    linenumbers=on
+    syntax=on
+    autopairs=on
+    session=on
+    recovery=on
+    recovery_interval=30
+    backup=on
 
-A useful starting point is:
+Optional syntax override:
 
-  cp /usr/local/share/tedit/teditrc.example ~/.teditrc
+    syntaxdir=~/.tedit/syntax
 
-For a personal ~/.local install, the example is at:
+A system install does **not** create files in users' home directories.
 
-  ~/.local/share/tedit/teditrc.example
+## Syntax definition search order
 
-TEDIT does not create or modify users' home directories during a system
-install.
+Later definitions with the same language name override earlier ones:
 
-SYNTAX SEARCH ORDER
--------------------
-Definitions are loaded in this order. Later definitions with the same language
-name override earlier ones:
+1. build-time system syntax directory, normally
+   `/usr/local/share/tedit/syntax`
+2. `~/.local/share/tedit/syntax`
+3. `./syntax`
+4. `$TEDIT_SYNTAX_DIR`
+5. `~/.tedit/syntax`
+6. `syntaxdir=...` in `~/.teditrc`
 
-  build-time system syntax directory
-  ~/.local/share/tedit/syntax
-  ./syntax
-  $TEDIT_SYNTAX_DIR
-  ~/.tedit/syntax
-  syntaxdir=... from ~/.teditrc   (highest priority)
-
-The build-time system directory defaults to:
-
-  /usr/local/share/tedit/syntax
-
-and follows PREFIX when TEDIT is built using the supplied Makefile.
-
-ADDING A LANGUAGE
------------------
-Create a .conf file. No recompilation is required.
+Adding a language does not require recompiling TEDIT.
 
 Example:
 
-  name=Example
-  extensions=.ex,.example
-  filenames=Examplefile
-  line_comment=//
-  block_comment_start=/*
-  block_comment_end=*/
-  strings="'
-  preprocessor=#
-  case_insensitive=no
-  numbers=yes
-  escape_strings=yes
-  doubled_quotes=no
-  keywords=if,else,while,return
-  indent_after={
-  outdent_before=}
-  outdent_chars=}
+    name=Example
+    extensions=.ex,.example
+    filenames=Examplefile
+    line_comment=//
+    block_comment_start=/*
+    block_comment_end=*/
+    strings="'
+    preprocessor=#
+    case_insensitive=no
+    numbers=yes
+    escape_strings=yes
+    doubled_quotes=no
+    keywords=if,else,while,return
+    indent_after={
+    outdent_before=}
+    outdent_chars=}
 
-Supported keys:
-  name                 required display/override name
-  extensions           comma-separated filename suffixes
-  filenames            comma-separated exact basenames
-  line_comment         line-comment token; omit for none
-  block_comment_start  opening block-comment token
-  block_comment_end    closing block-comment token
-  strings              characters that can quote strings
-  preprocessor         token highlighted to end-of-line at first non-space
-  case_insensitive     yes/no
-  numbers              yes/no
-  escape_strings       yes/no for backslash escaping
-  doubled_quotes       yes/no for Ada/Fortran-style doubled quote escaping
-  keywords             comma-separated; may occur multiple times
-  indent_after         comma-separated line-ending tokens
-  outdent_before       comma-separated line-start tokens
-  outdent_chars        individual closing characters such as }]
+## Projects
 
-SHIPPED DEFINITIONS
--------------------
-  C/C++/headers
-  Python
-  Shell
-  Makefile
-  Perl
-  Fortran
-  Ada
-  JSON
-  Rust
-  Go
-  JavaScript
-  TypeScript
+TEDIT detects a project root by looking upward for common markers including
+`.tedit-project`, `.git`, `Makefile`, `GNUmakefile`, `configure` and
+`CMakeLists.txt`.
 
-NOTES
------
-Syntax colour rendering uses the ANSI overlay fallback that works on SGI IRIX
-even when old curses reports has_colors()==0.
+A project can override the default commands with a file named
+`.tedit-project` in the project root:
 
-Formatting is language-driven for line comment/uncomment, newline indentation,
-and configured closing-character outdent. It is intentionally lightweight
-rather than a full source-code pretty-printer.
+    build=make
+    clean=make clean
+    run=./myprogram
+
+The repository contains `tedit-project.example`.
+
+Build/run output is captured inside TEDIT. The output/results browser lets you
+select lines in the conventional `file:line:message` form and press Enter to
+jump directly to that source location.
+
+## File navigator
+
+Open uses a two-pane navigator inspired by Midnight Commander.
+
+Keys inside the navigator:
+
+    Tab         switch pane
+    Up/Down     move selection
+    Enter       enter a directory or open a file
+    Backspace   parent directory
+    c           copy selected file/directory to other pane
+    m           move selected file/directory to other pane
+    d           delete selected file/directory
+    r           rename
+    n           create directory
+    g           go to path
+    h           toggle hidden files
+    s           cycle name / size / date sorting
+    b           bookmark current directory
+    j           jump to directory bookmark
+    Esc         cancel
+
+## Sessions, backups and recovery
+
+When enabled, TEDIT records the open file set and cursor positions in:
+
+    ~/.tedit/session
+
+It also restores view state such as split view and the symbol sidebar.
+
+Recovery snapshots are periodically written under:
+
+    ~/.tedit/recovery/
+
+They are removed after a normal clean exit. If a terminal, SSH connection or
+process dies, use **File -> Recover autosave...** on the next run.
+
+With `backup=on`, saving an existing file first copies its previous contents
+to:
+
+    filename~
+
+## Portability
+
+The core intentionally avoids depending on a modern language runtime or regex
+library. Mouse support is compiled only when the curses implementation exposes
+the relevant API; keyboard operation remains the baseline.
+
+TEDIT currently targets classic and modern Unix-like systems, with IRIX as an
+explicit compatibility target.
