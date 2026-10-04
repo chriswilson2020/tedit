@@ -370,6 +370,12 @@ static int load_file(const char *name);
 static int path_exists(const char *path);
 static int create_new_buffer(void);
 static void scroll_screen(void);
+static void reset_edit_history(void);
+static void finalize_pending_undo(void);
+static void free_capture(UndoCapture *cap);
+static void clear_stack(EditOp *stack, int *count);
+static int confirm_yes_no(const char *message);
+static void compute_bracket_match(void);
 
 static void set_status(const char *s)
 {
