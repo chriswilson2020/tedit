@@ -13,7 +13,7 @@ static int def_count = 0;
 
 static void trim(char *s)
 {
-    char *p;
+    const char *p;
     int len;
 
     while (*s && isspace((unsigned char)*s))
