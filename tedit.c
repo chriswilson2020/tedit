@@ -61,6 +61,8 @@
 #define BROWSER_MAX  512
 #define PATH_LEN     2048
 #define MAX_BUFFERS  8
+#define OUTPUT_MAX   256
+#define OUTPUT_LINE  512
 
 #define CTRL_KEY(x) ((x) & 0x1f)
 
@@ -124,6 +126,14 @@ enum {
     ACT_MATCH_BRACKET,
     ACT_BOOKMARK_TOGGLE,
     ACT_BOOKMARK_NEXT,
+    ACT_PROJECT_ROOT,
+    ACT_PROJECT_OPEN,
+    ACT_BUILD,
+    ACT_CLEAN,
+    ACT_RUN,
+    ACT_FIND_FILES,
+    ACT_NEXT_RESULT,
+    ACT_TOGGLE_OUTPUT,
     ACT_FIND,
     ACT_REPLACE,
     ACT_GOTO,
@@ -175,6 +185,16 @@ static char statusmsg[STATUS_LEN];
 static char last_search[SEARCH_LEN];
 
 static char *clipboard = NULL;
+
+static char project_root[PATH_LEN];
+static char project_build[256];
+static char project_clean[256];
+static char project_run[256];
+
+static char output_lines[OUTPUT_MAX][OUTPUT_LINE];
+static int output_count = 0;
+static int output_visible = 0;
+static int output_cursor = 0;
 
 static Snapshot undo_stack[UNDO_DEPTH];
 static int undo_count = 0;
@@ -232,6 +252,17 @@ static const MenuItem search_menu[] = {
     {"Next bookmark", ACT_BOOKMARK_NEXT}
 };
 
+static const MenuItem project_menu[] = {
+    {"Detect project root", ACT_PROJECT_ROOT},
+    {"Open project file...", ACT_PROJECT_OPEN},
+    {"Build", ACT_BUILD},
+    {"Clean", ACT_CLEAN},
+    {"Run", ACT_RUN},
+    {"Find in files...", ACT_FIND_FILES},
+    {"Next result/error", ACT_NEXT_RESULT},
+    {"Toggle output pane", ACT_TOGGLE_OUTPUT}
+};
+
 static const MenuItem options_menu[] = {
     {"Toggle syntax", ACT_TOGGLE_SYNTAX},
     {"Toggle line numbers", ACT_TOGGLE_LINES},
@@ -247,8 +278,11 @@ static const MenuItem help_menu[] = {
 };
 
 static const char *menu_names[] = {
-    "File", "Edit", "Search", "Options", "Help"
+    "File", "Edit", "Search", "Project", "Options", "Help"
 };
+
+#define MENU_COUNT 6
+
 
 static char *dupstr(const char *s)
 {
@@ -265,6 +299,402 @@ static void set_status(const char *s)
     statusmsg[STATUS_LEN - 1] = '\0';
 }
 
+
+static int output_pane_height(void)
+{
+    int h;
+
+    if (!output_visible || output_count <= 0)
+        return 0;
+
+    h = LINES / 3;
+    if (h < 4)
+        h = 4;
+    if (h > 10)
+        h = 10;
+    if (h > LINES - 6)
+        h = LINES - 6;
+
+    return h > 0 ? h : 0;
+}
+
+static void output_clear(void)
+{
+    output_count = 0;
+    output_cursor = 0;
+}
+
+static void output_add(const char *s)
+{
+    int len;
+
+    if (output_count >= OUTPUT_MAX)
+        return;
+
+    strncpy(output_lines[output_count], s, OUTPUT_LINE - 1);
+    output_lines[output_count][OUTPUT_LINE - 1] = '\0';
+
+    len = (int)strlen(output_lines[output_count]);
+    while (len > 0 &&
+          (output_lines[output_count][len - 1] == '\n' ||
+           output_lines[output_count][len - 1] == '\r')) {
+        output_lines[output_count][--len] = '\0';
+    }
+
+    output_count++;
+}
+
+static int path_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int project_marker_exists(const char *dir)
+{
+    char p[PATH_LEN];
+
+    sprintf(p, "%s/.tedit-project", dir);
+    if (path_exists(p)) return 1;
+    sprintf(p, "%s/.git", dir);
+    if (path_exists(p)) return 1;
+    sprintf(p, "%s/Makefile", dir);
+    if (path_exists(p)) return 1;
+    sprintf(p, "%s/GNUmakefile", dir);
+    if (path_exists(p)) return 1;
+    sprintf(p, "%s/configure", dir);
+    if (path_exists(p)) return 1;
+    sprintf(p, "%s/CMakeLists.txt", dir);
+    if (path_exists(p)) return 1;
+
+    return 0;
+}
+
+static void load_project_commands(void)
+{
+    char cfg[PATH_LEN];
+    char line[512];
+    FILE *fp;
+
+    strcpy(project_build, "make");
+    strcpy(project_clean, "make clean");
+    strcpy(project_run, "./a.out");
+
+    if (project_root[0] == '\0')
+        return;
+
+    sprintf(cfg, "%s/.tedit-project", project_root);
+    fp = fopen(cfg, "r");
+    if (fp == NULL)
+        return;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl;
+
+        nl = strchr(line, '\n');
+        if (nl != NULL)
+            *nl = '\0';
+
+        if (!strncmp(line, "build=", 6)) {
+            strncpy(project_build, line + 6, sizeof(project_build) - 1);
+            project_build[sizeof(project_build) - 1] = '\0';
+        } else if (!strncmp(line, "clean=", 6)) {
+            strncpy(project_clean, line + 6, sizeof(project_clean) - 1);
+            project_clean[sizeof(project_clean) - 1] = '\0';
+        } else if (!strncmp(line, "run=", 4)) {
+            strncpy(project_run, line + 4, sizeof(project_run) - 1);
+            project_run[sizeof(project_run) - 1] = '\0';
+        }
+    }
+
+    fclose(fp);
+}
+
+static int detect_project_root(void)
+{
+    char path[PATH_LEN];
+
+    if (filename[0] != '\0') {
+        strncpy(path, filename, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+
+        if (path[0] != '/') {
+            char cwd[PATH_LEN];
+            char joined[PATH_LEN];
+
+            if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                sprintf(joined, "%s/%s", cwd, path);
+                strncpy(path, joined, sizeof(path) - 1);
+                path[sizeof(path) - 1] = '\0';
+            }
+        }
+
+        path_parent(path);
+    } else if (getcwd(path, sizeof(path)) == NULL) {
+        strcpy(path, ".");
+    }
+
+    for (;;) {
+        char old[PATH_LEN];
+
+        if (project_marker_exists(path)) {
+            strncpy(project_root, path, sizeof(project_root) - 1);
+            project_root[sizeof(project_root) - 1] = '\0';
+            load_project_commands();
+            sprintf(statusmsg, "Project: %s", project_root);
+            return 1;
+        }
+
+        strcpy(old, path);
+        path_parent(path);
+
+        if (!strcmp(old, path))
+            break;
+    }
+
+    project_root[0] = '\0';
+    set_status("No project root found");
+    return 0;
+}
+
+static int ensure_project(void)
+{
+    if (project_root[0] != '\0')
+        return 1;
+    return detect_project_root();
+}
+
+static void run_project_command(const char *cmd, const char *label)
+{
+    FILE *fp;
+    char shellcmd[PATH_LEN + 512];
+    char line[OUTPUT_LINE];
+    char oldcwd[PATH_LEN];
+    int status;
+
+    if (!ensure_project())
+        return;
+
+    if (getcwd(oldcwd, sizeof(oldcwd)) == NULL)
+        oldcwd[0] = '\0';
+
+    if (chdir(project_root) != 0) {
+        set_status("Cannot enter project directory");
+        return;
+    }
+
+    sprintf(shellcmd, "%s 2>&1", cmd);
+    fp = popen(shellcmd, "r");
+
+    output_clear();
+
+    if (fp == NULL) {
+        output_add("Unable to start command.");
+        output_visible = 1;
+        if (oldcwd[0] != '\0')
+            chdir(oldcwd);
+        return;
+    }
+
+    sprintf(line, "$ %s", cmd);
+    output_add(line);
+
+    while (fgets(line, sizeof(line), fp) != NULL)
+        output_add(line);
+
+    status = pclose(fp);
+
+    sprintf(line, "[%s finished: status %d]", label, status);
+    output_add(line);
+    output_visible = 1;
+    output_cursor = 0;
+
+    if (oldcwd[0] != '\0')
+        chdir(oldcwd);
+
+    sprintf(statusmsg, "%s finished", label);
+}
+
+static int find_in_tree(const char *dir, const char *needle, int depth)
+{
+    DIR *dp;
+    struct dirent *de;
+
+    if (depth > 24 || output_count >= OUTPUT_MAX)
+        return 0;
+
+    dp = opendir(dir);
+    if (dp == NULL)
+        return 0;
+
+    while ((de = readdir(dp)) != NULL && output_count < OUTPUT_MAX) {
+        char path[PATH_LEN];
+        struct stat st;
+
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..") ||
+            !strcmp(de->d_name, ".git") || !strcmp(de->d_name, ".svn") ||
+            !strcmp(de->d_name, "node_modules"))
+            continue;
+
+        sprintf(path, "%s/%s", dir, de->d_name);
+
+        if (stat(path, &st) != 0)
+            continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            find_in_tree(path, needle, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            FILE *fp;
+            char line[OUTPUT_LINE];
+            int lineno;
+
+            fp = fopen(path, "r");
+            if (fp == NULL)
+                continue;
+
+            lineno = 0;
+            while (fgets(line, sizeof(line), fp) != NULL &&
+                   output_count < OUTPUT_MAX) {
+                lineno++;
+
+                if (strstr(line, needle) != NULL) {
+                    char result[OUTPUT_LINE];
+                    char *rel;
+
+                    rel = path;
+                    if (project_root[0] != '\0' &&
+                        !strncmp(path, project_root, strlen(project_root))) {
+                        rel = path + strlen(project_root);
+                        if (*rel == '/')
+                            rel++;
+                    }
+
+                    sprintf(result, "%s:%d:%s", rel, lineno, line);
+                    output_add(result);
+                }
+            }
+
+            fclose(fp);
+        }
+    }
+
+    closedir(dp);
+    return output_count;
+}
+
+static void do_find_in_files(void)
+{
+    char query[SEARCH_LEN];
+
+    if (!ensure_project())
+        return;
+
+    if (!prompt_input("Find in project: ", query, sizeof(query)) || !query[0]) {
+        set_status("Find in files cancelled");
+        return;
+    }
+
+    output_clear();
+    find_in_tree(project_root, query, 0);
+    output_visible = 1;
+    output_cursor = 0;
+
+    sprintf(statusmsg, "%d project match(es)", output_count);
+}
+
+static int jump_to_output_location(void)
+{
+    int attempts;
+
+    if (output_count <= 0) {
+        set_status("No output results");
+        return 0;
+    }
+
+    for (attempts = 0; attempts < output_count; attempts++) {
+        char buf[OUTPUT_LINE];
+        char *p1;
+        char *p2;
+        int line;
+        char full[PATH_LEN];
+
+        if (output_cursor >= output_count)
+            output_cursor = 0;
+
+        strncpy(buf, output_lines[output_cursor], sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        output_cursor++;
+
+        p1 = strchr(buf, ':');
+        if (p1 == NULL)
+            continue;
+        *p1++ = '\0';
+
+        p2 = strchr(p1, ':');
+        if (p2 == NULL)
+            continue;
+        *p2 = '\0';
+
+        line = atoi(p1);
+        if (line <= 0)
+            continue;
+
+        if (buf[0] == '/') {
+            strncpy(full, buf, sizeof(full) - 1);
+            full[sizeof(full) - 1] = '\0';
+        } else if (project_root[0] != '\0') {
+            sprintf(full, "%s/%s", project_root, buf);
+        } else {
+            strncpy(full, buf, sizeof(full) - 1);
+            full[sizeof(full) - 1] = '\0';
+        }
+
+        if (path_exists(full)) {
+            load_file(full);
+            cy = line - 1;
+            if (cy < 0) cy = 0;
+            if (cy >= nlines) cy = nlines - 1;
+            cx = 0;
+            scroll_screen();
+            sprintf(statusmsg, "%s:%d", buf, line);
+            return 1;
+        }
+    }
+
+    set_status("No navigable file:line result");
+    return 0;
+}
+
+static void do_project_open(void)
+{
+    char oldcwd[PATH_LEN];
+    char name[PATH_LEN];
+
+    if (!ensure_project())
+        return;
+
+    if (getcwd(oldcwd, sizeof(oldcwd)) == NULL)
+        oldcwd[0] = '\0';
+
+    if (chdir(project_root) != 0) {
+        set_status("Cannot enter project directory");
+        return;
+    }
+
+    if (file_browser(name, sizeof(name)))
+        load_file(name);
+    else
+        set_status("Open cancelled");
+
+    if (oldcwd[0] != '\0')
+        chdir(oldcwd);
+}
+
+
+static int prompt_input(const char *prompt, char *out, int outlen);
+static void path_parent(char *path);
+static int file_browser(char *out, int outlen);
+static int load_file(const char *name);
 static void clear_stack(Snapshot *stack, int *count);
 static int confirm_yes_no(const char *message);
 static void scroll_screen(void);
@@ -1853,7 +2283,7 @@ static void scroll_screen(void)
     int textcols;
 
     gutter = line_numbers ? 6 : 0;
-    textrows = LINES - 3;
+    textrows = LINES - 3 - output_pane_height();
     textcols = COLS - gutter - 1;
 
     if (textrows < 1)
@@ -2183,6 +2613,8 @@ static void draw_screen(void)
     int gutter;
     char buf[STATUS_LEN];
     int name_room;
+    int output_h;
+    int status_y;
     scroll_screen();
     compute_bracket_match();
     erase();
@@ -2192,12 +2624,12 @@ static void draw_screen(void)
     else
         attron(A_REVERSE);
 
-    mvaddstr(0, 0, " File  Edit  Search  Options  Help ");
+    mvaddstr(0, 0, " File  Edit  Search  Project  Options  Help ");
     {
         int bx;
         int bi;
 
-        bx = 35;
+        bx = 45;
 
         for (bi = 0; bi < buffer_count && bx < COLS - 4; bi++) {
             const char *bn;
@@ -2266,6 +2698,9 @@ static void draw_screen(void)
     else
         attron(A_REVERSE);
 
+    output_h = output_pane_height();
+    status_y = LINES - 2 - output_h;
+
     name_room = COLS - 48;
     if (name_room < 10)
         name_room = 10;
@@ -2278,7 +2713,7 @@ static void draw_screen(void)
             syntax_enabled ? syntax_name() : "TEXT",
             cy + 1, nlines, cx + 1, tab_width);
 
-    mvaddnstr(LINES - 2, 0, buf, COLS);
+    mvaddnstr(status_y, 0, buf, COLS);
     clrtoeol();
 
     if (use_color)
@@ -2286,14 +2721,40 @@ static void draw_screen(void)
     else
         attroff(A_REVERSE);
 
-    mvaddstr(LINES - 1, 0,
+    mvaddstr(status_y + 1, 0,
              "^T Menu ^S Save ^F Find ^H Repl ^B Sel ^Z Undo ^Q Quit");
 
     if (statusmsg[0] != '\0') {
         int pos;
         pos = COLS - (int)strlen(statusmsg) - 1;
         if (pos > 0)
-            mvaddnstr(LINES - 1, pos, statusmsg, COLS - pos);
+            mvaddnstr(status_y + 1, pos, statusmsg, COLS - pos);
+    }
+
+    if (output_h > 0) {
+        int oy;
+        int first;
+
+        first = output_count - output_h + 1;
+        if (first < 0)
+            first = 0;
+
+        attron(A_REVERSE);
+        mvaddstr(status_y + 2, 0, " Output ");
+        clrtoeol();
+        attroff(A_REVERSE);
+
+        for (oy = 1; oy < output_h; oy++) {
+            int oi;
+
+            oi = first + oy - 1;
+            move(status_y + 2 + oy, 0);
+            clrtoeol();
+
+            if (oi < output_count)
+                mvaddnstr(status_y + 2 + oy, 0,
+                          output_lines[oi], COLS - 1);
+        }
     }
 
     move((cy - rowoff) + 1,
@@ -2991,7 +3452,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 2");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -3131,6 +3592,17 @@ static void execute_action(int action)
     case ACT_MATCH_BRACKET: goto_matching_bracket(); break;
     case ACT_BOOKMARK_TOGGLE: toggle_bookmark(); break;
     case ACT_BOOKMARK_NEXT: next_bookmark(); break;
+    case ACT_PROJECT_ROOT: detect_project_root(); break;
+    case ACT_PROJECT_OPEN: do_project_open(); break;
+    case ACT_BUILD: run_project_command(project_build, "Build"); break;
+    case ACT_CLEAN: run_project_command(project_clean, "Clean"); break;
+    case ACT_RUN: run_project_command(project_run, "Run"); break;
+    case ACT_FIND_FILES: do_find_in_files(); break;
+    case ACT_NEXT_RESULT: jump_to_output_location(); break;
+    case ACT_TOGGLE_OUTPUT:
+        output_visible = !output_visible;
+        set_status(output_visible ? "Output pane shown" : "Output pane hidden");
+        break;
     case ACT_FIND: do_find(); break;
     case ACT_REPLACE: do_replace(); break;
     case ACT_GOTO: do_goto(); break;
@@ -3172,9 +3644,12 @@ static const MenuItem *get_menu(int menu_index, int *count)
         *count = sizeof(search_menu) / sizeof(search_menu[0]);
         return search_menu;
     case 3:
+        *count = sizeof(project_menu) / sizeof(project_menu[0]);
+        return project_menu;
+    case 4:
         *count = sizeof(options_menu) / sizeof(options_menu[0]);
         return options_menu;
-    case 4:
+    case 5:
         *count = sizeof(help_menu) / sizeof(help_menu[0]);
         return help_menu;
     }
@@ -3237,7 +3712,7 @@ static void draw_menu_bar_selected(int selected_menu)
 
     x = 1;
 
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < MENU_COUNT; i++) {
         if (i == selected_menu) {
             if (use_color)
                 attron(COLOR_PAIR(CP_MENU_SEL));
@@ -3410,12 +3885,12 @@ static void activate_menu(void)
         if (ch == KEY_LEFT) {
             menu_index--;
             if (menu_index < 0)
-                menu_index = 4;
+                menu_index = MENU_COUNT - 1;
             items = get_menu(menu_index, &count);
             item_index = first_selectable(items, count);
         } else if (ch == KEY_RIGHT) {
             menu_index++;
-            if (menu_index > 4)
+            if (menu_index >= MENU_COUNT)
                 menu_index = 0;
             items = get_menu(menu_index, &count);
             item_index = first_selectable(items, count);
@@ -3692,6 +4167,10 @@ int main(int argc, char **argv)
     statusmsg[0] = '\0';
     last_search[0] = '\0';
     syntax_dir_override[0] = '\0';
+    project_root[0] = '\0';
+    strcpy(project_build, "make");
+    strcpy(project_clean, "make clean");
+    strcpy(project_run, "./a.out");
 
     curbuf = 0;
     buffer_count = 1;
