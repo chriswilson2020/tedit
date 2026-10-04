@@ -61,7 +61,7 @@ extern int pclose(FILE *stream);
 #define STATUS_LEN  1024
 #define SEARCH_LEN  256
 #define CLIP_LEN    65536
-#define UNDO_DEPTH  64
+#define UNDO_DEPTH  256
 #define BROWSER_MAX  512
 #define PATH_LEN     2048
 #define MAX_BUFFERS  8
@@ -85,11 +85,27 @@ extern int pclose(FILE *stream);
 #define CP_MATCH    12
 
 typedef struct {
-    char **snap_lines;
-    int snap_nlines;
-    int snap_cy, snap_cx;
-    int snap_rowoff, snap_coloff;
-} Snapshot;
+    char **cap_lines;
+    int cap_nlines;
+    int cap_cy, cap_cx;
+    int cap_rowoff, cap_coloff;
+    int cap_modified;
+    int valid;
+} UndoCapture;
+
+typedef struct {
+    int start_row;
+    char **old_lines;
+    int old_count;
+    char **new_lines;
+    int new_count;
+    int before_cy, before_cx;
+    int before_rowoff, before_coloff;
+    int after_cy, after_cx;
+    int after_rowoff, after_coloff;
+    int before_modified;
+    int after_modified;
+} EditOp;
 
 typedef struct {
     const char *label;
@@ -230,10 +246,11 @@ static time_t last_recovery_time = 0;
 static char recent_files[RECENT_MAX][PATH_LEN];
 static int recent_count = 0;
 
-static Snapshot undo_stack[UNDO_DEPTH];
+static EditOp undo_stack[UNDO_DEPTH];
 static int undo_count = 0;
-static Snapshot redo_stack[UNDO_DEPTH];
+static EditOp redo_stack[UNDO_DEPTH];
 static int redo_count = 0;
+static UndoCapture pending_undo;
 
 
 static const MenuItem file_menu[] = {
@@ -1516,7 +1533,8 @@ static int prompt_input(const char *prompt, char *out, int outlen);
 static void path_parent(char *path);
 static int file_browser(char *out, int outlen);
 static int load_file(const char *name);
-static void clear_stack(Snapshot *stack, int *count);
+static void clear_stack(EditOp *stack, int *count);
+static void finalize_pending_undo(void);
 static int confirm_yes_no(const char *message);
 static void scroll_screen(void);
 static void compute_bracket_match(void);
@@ -1562,6 +1580,8 @@ static void free_buffer(void)
 
 static void reset_edit_history(void)
 {
+    finalize_pending_undo();
+    free_capture(&pending_undo);
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
     selecting = 0;
@@ -1650,140 +1670,348 @@ static void close_current_buffer(void)
 }
 
 
-static void free_snapshot(Snapshot *s)
+static void free_line_vector(char **v, int count)
 {
     int i;
-    if (s->snap_lines != NULL) {
-        for (i = 0; i < s->snap_nlines; i++)
-            if (s->snap_lines[i] != NULL)
-                free(s->snap_lines[i]);
-        free(s->snap_lines);
+
+    if (v == NULL)
+        return;
+
+    for (i = 0; i < count; i++) {
+        if (v[i] != NULL)
+            free(v[i]);
     }
-    s->snap_lines = NULL;
-    s->snap_nlines = 0;
+
+    free(v);
 }
 
-static int make_snapshot(Snapshot *s)
+static void free_capture(UndoCapture *cap)
+{
+    if (cap == NULL || !cap->valid)
+        return;
+
+    free_line_vector(cap->cap_lines, cap->cap_nlines);
+    memset(cap, 0, sizeof(*cap));
+}
+
+static int capture_current(UndoCapture *cap)
 {
     int i;
 
-    s->snap_lines = (char **)malloc(sizeof(char *) * nlines);
-    if (s->snap_lines == NULL)
+    memset(cap, 0, sizeof(*cap));
+
+    cap->cap_lines = (char **)malloc(sizeof(char *) * nlines);
+    if (cap->cap_lines == NULL)
         return -1;
 
-    s->snap_nlines = nlines;
-    s->snap_cy = cy;
-    s->snap_cx = cx;
-    s->snap_rowoff = rowoff;
-    s->snap_coloff = coloff;
+    cap->cap_nlines = nlines;
+    cap->cap_cy = cy;
+    cap->cap_cx = cx;
+    cap->cap_rowoff = rowoff;
+    cap->cap_coloff = coloff;
+    cap->cap_modified = modified;
 
     for (i = 0; i < nlines; i++) {
-        s->snap_lines[i] = dupstr(lines[i]);
-        if (s->snap_lines[i] == NULL) {
-            int j;
-            for (j = 0; j < i; j++)
-                free(s->snap_lines[j]);
-            free(s->snap_lines);
-            s->snap_lines = NULL;
+        cap->cap_lines[i] = dupstr(lines[i]);
+
+        if (cap->cap_lines[i] == NULL) {
+            free_line_vector(cap->cap_lines, i);
+            memset(cap, 0, sizeof(*cap));
             return -1;
         }
     }
 
+    cap->valid = 1;
     return 0;
 }
 
-static void restore_snapshot(const Snapshot *s)
+static void free_edit_op(EditOp *op)
 {
-    int i;
+    if (op == NULL)
+        return;
 
-    free_buffer();
-
-    nlines = s->snap_nlines;
-    for (i = 0; i < nlines; i++)
-        lines[i] = dupstr(s->snap_lines[i]);
-
-    cy = s->snap_cy;
-    cx = s->snap_cx;
-    rowoff = s->snap_rowoff;
-    coloff = s->snap_coloff;
-    modified = 1;
-    selecting = 0;
+    free_line_vector(op->old_lines, op->old_count);
+    free_line_vector(op->new_lines, op->new_count);
+    memset(op, 0, sizeof(*op));
 }
 
-static void clear_stack(Snapshot *stack, int *count)
+static void clear_stack(EditOp *stack, int *count)
 {
     int i;
+
     for (i = 0; i < *count; i++)
-        free_snapshot(&stack[i]);
+        free_edit_op(&stack[i]);
+
     *count = 0;
+}
+
+static char **copy_line_range(char **src, int start, int count)
+{
+    char **v;
+    int i;
+
+    if (count <= 0)
+        return NULL;
+
+    v = (char **)malloc(sizeof(char *) * count);
+    if (v == NULL)
+        return NULL;
+
+    for (i = 0; i < count; i++) {
+        v[i] = dupstr(src[start + i]);
+
+        if (v[i] == NULL) {
+            free_line_vector(v, i);
+            return NULL;
+        }
+    }
+
+    return v;
+}
+
+static void push_edit_op(EditOp *op)
+{
+    int i;
+
+    if (op->old_count == 0 && op->new_count == 0) {
+        free_edit_op(op);
+        return;
+    }
+
+    if (undo_count == UNDO_DEPTH) {
+        free_edit_op(&undo_stack[0]);
+
+        for (i = 1; i < UNDO_DEPTH; i++)
+            undo_stack[i - 1] = undo_stack[i];
+
+        memset(&undo_stack[UNDO_DEPTH - 1], 0, sizeof(EditOp));
+        undo_count--;
+    }
+
+    undo_stack[undo_count++] = *op;
+    memset(op, 0, sizeof(*op));
+}
+
+static void finalize_pending_undo(void)
+{
+    EditOp op;
+    int prefix;
+    int suffix;
+    int old_remaining;
+    int new_remaining;
+
+    if (!pending_undo.valid)
+        return;
+
+    prefix = 0;
+
+    while (prefix < pending_undo.cap_nlines &&
+           prefix < nlines &&
+           !strcmp(pending_undo.cap_lines[prefix], lines[prefix]))
+        prefix++;
+
+    suffix = 0;
+    old_remaining = pending_undo.cap_nlines - prefix;
+    new_remaining = nlines - prefix;
+
+    while (suffix < old_remaining &&
+           suffix < new_remaining &&
+           !strcmp(pending_undo.cap_lines[pending_undo.cap_nlines - 1 - suffix],
+                   lines[nlines - 1 - suffix]))
+        suffix++;
+
+    memset(&op, 0, sizeof(op));
+    op.start_row = prefix;
+    op.old_count = pending_undo.cap_nlines - prefix - suffix;
+    op.new_count = nlines - prefix - suffix;
+
+    if (op.old_count == 0 && op.new_count == 0) {
+        free_capture(&pending_undo);
+        return;
+    }
+
+    op.old_lines = copy_line_range(pending_undo.cap_lines,
+                                   prefix, op.old_count);
+    op.new_lines = copy_line_range(lines, prefix, op.new_count);
+
+    if ((op.old_count > 0 && op.old_lines == NULL) ||
+        (op.new_count > 0 && op.new_lines == NULL)) {
+        free_edit_op(&op);
+        free_capture(&pending_undo);
+        return;
+    }
+
+    op.before_cy = pending_undo.cap_cy;
+    op.before_cx = pending_undo.cap_cx;
+    op.before_rowoff = pending_undo.cap_rowoff;
+    op.before_coloff = pending_undo.cap_coloff;
+    op.before_modified = pending_undo.cap_modified;
+
+    op.after_cy = cy;
+    op.after_cx = cx;
+    op.after_rowoff = rowoff;
+    op.after_coloff = coloff;
+    op.after_modified = modified;
+
+    push_edit_op(&op);
+    free_capture(&pending_undo);
+}
+
+static void replace_line_patch(int start, int remove_count,
+                               char **add_lines, int add_count)
+{
+    int delta;
+    int tail_start;
+    int i;
+
+    if (start < 0)
+        start = 0;
+    if (start > nlines)
+        start = nlines;
+
+    if (remove_count < 0)
+        remove_count = 0;
+    if (start + remove_count > nlines)
+        remove_count = nlines - start;
+
+    for (i = start; i < start + remove_count; i++) {
+        if (lines[i] != NULL)
+            free(lines[i]);
+        lines[i] = NULL;
+    }
+
+    delta = add_count - remove_count;
+    tail_start = start + remove_count;
+
+    if (delta > 0) {
+        for (i = nlines - 1; i >= tail_start; i--)
+            lines[i + delta] = lines[i];
+    } else if (delta < 0) {
+        for (i = tail_start; i < nlines; i++)
+            lines[i + delta] = lines[i];
+
+        for (i = nlines + delta; i < nlines; i++)
+            lines[i] = NULL;
+    }
+
+    for (i = 0; i < add_count; i++)
+        lines[start + i] = dupstr(add_lines[i]);
+
+    nlines += delta;
+
+    if (nlines <= 0) {
+        lines[0] = dupstr("");
+        nlines = 1;
+    }
+}
+
+static void apply_edit_op(const EditOp *op, int undoing)
+{
+    if (undoing) {
+        replace_line_patch(op->start_row,
+                           op->new_count,
+                           op->old_lines,
+                           op->old_count);
+
+        cy = op->before_cy;
+        cx = op->before_cx;
+        rowoff = op->before_rowoff;
+        coloff = op->before_coloff;
+        modified = op->before_modified;
+    } else {
+        replace_line_patch(op->start_row,
+                           op->old_count,
+                           op->new_lines,
+                           op->new_count);
+
+        cy = op->after_cy;
+        cx = op->after_cx;
+        rowoff = op->after_rowoff;
+        coloff = op->after_coloff;
+        modified = op->after_modified;
+    }
+
+    if (cy < 0)
+        cy = 0;
+    if (cy >= nlines)
+        cy = nlines - 1;
+    if (cx < 0)
+        cx = 0;
+    if (cx > (int)strlen(lines[cy]))
+        cx = (int)strlen(lines[cy]);
+
+    selecting = 0;
+    column_selecting = 0;
 }
 
 static void push_undo(void)
 {
-    int i;
-
-    if (undo_count == UNDO_DEPTH) {
-        free_snapshot(&undo_stack[0]);
-        for (i = 1; i < UNDO_DEPTH; i++)
-            undo_stack[i - 1] = undo_stack[i];
-        undo_count--;
-    }
-
-    if (make_snapshot(&undo_stack[undo_count]) == 0)
-        undo_count++;
-
+    finalize_pending_undo();
     clear_stack(redo_stack, &redo_count);
+
+    free_capture(&pending_undo);
+    capture_current(&pending_undo);
 }
 
 static void do_undo(void)
 {
-    Snapshot cur;
+    EditOp op;
+    int i;
+
+    finalize_pending_undo();
 
     if (undo_count <= 0) {
         set_status("Nothing to undo");
         return;
     }
 
-    if (make_snapshot(&cur) == 0) {
-        if (redo_count == UNDO_DEPTH) {
-            free_snapshot(&redo_stack[0]);
-            memmove(&redo_stack[0], &redo_stack[1],
-                    sizeof(Snapshot) * (UNDO_DEPTH - 1));
-            redo_count--;
-        }
-        redo_stack[redo_count++] = cur;
+    undo_count--;
+    op = undo_stack[undo_count];
+    memset(&undo_stack[undo_count], 0, sizeof(EditOp));
+
+    apply_edit_op(&op, 1);
+
+    if (redo_count == UNDO_DEPTH) {
+        free_edit_op(&redo_stack[0]);
+
+        for (i = 1; i < UNDO_DEPTH; i++)
+            redo_stack[i - 1] = redo_stack[i];
+
+        redo_count--;
     }
 
-    undo_count--;
-    restore_snapshot(&undo_stack[undo_count]);
-    free_snapshot(&undo_stack[undo_count]);
-
+    redo_stack[redo_count++] = op;
     set_status("Undo");
 }
 
 static void do_redo(void)
 {
-    Snapshot cur;
+    EditOp op;
+    int i;
+
+    finalize_pending_undo();
 
     if (redo_count <= 0) {
         set_status("Nothing to redo");
         return;
     }
 
-    if (make_snapshot(&cur) == 0) {
-        if (undo_count == UNDO_DEPTH) {
-            free_snapshot(&undo_stack[0]);
-            memmove(&undo_stack[0], &undo_stack[1],
-                    sizeof(Snapshot) * (UNDO_DEPTH - 1));
-            undo_count--;
-        }
-        undo_stack[undo_count++] = cur;
+    redo_count--;
+    op = redo_stack[redo_count];
+    memset(&redo_stack[redo_count], 0, sizeof(EditOp));
+
+    apply_edit_op(&op, 0);
+
+    if (undo_count == UNDO_DEPTH) {
+        free_edit_op(&undo_stack[0]);
+
+        for (i = 1; i < UNDO_DEPTH; i++)
+            undo_stack[i - 1] = undo_stack[i];
+
+        undo_count--;
     }
 
-    redo_count--;
-    restore_snapshot(&redo_stack[redo_count]);
-    free_snapshot(&redo_stack[redo_count]);
-
+    undo_stack[undo_count++] = op;
     set_status("Redo");
 }
 
@@ -1989,6 +2217,7 @@ static int save_file_as(const char *name)
     FILE *fp;
     int i;
 
+    finalize_pending_undo();
     backup_existing_file(name);
     fp = fopen(name, "w");
     if (fp == NULL) {
@@ -5081,7 +5310,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 6");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 7");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -5165,6 +5394,8 @@ static void quit_editor(void)
             free_buffer_index(bi);
     }
 
+    finalize_pending_undo();
+    free_capture(&pending_undo);
     clear_stack(undo_stack, &undo_count);
     clear_stack(redo_stack, &redo_count);
 
