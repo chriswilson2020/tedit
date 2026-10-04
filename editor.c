@@ -1,33 +1,39 @@
 /*
- * tedit_v3.c - portable curses text/code editor
+ * tedit_v4.c - portable curses text/code editor for classic UNIX
  *
  * Build:
- *   cc -o tedit tedit_v3.c -lcurses
- *
- * Designed for old UNIX systems including IRIX.
+ *   cc -o tedit tedit_v4.c -lcurses
  *
  * Features:
- *   - real interactive menu bar (F10)
- *   - File/Edit/Search/Options/Help menus
- *   - open, save, save as, quit
+ *   - interactive Ctrl-T menu bar
+ *   - open/save/save-as
  *   - smart indentation and tabbing
  *   - simple C/C++ syntax highlighting
- *   - search and find-next
- *   - cut/copy/paste current line
+ *   - find / replace / replace all
+ *   - goto line
+ *   - linear undo / redo
+ *   - selection mode + copy/cut/paste
+ *   - current-line copy/cut still supported
+ *   - bracket matching indicator
  *   - line numbers, status bar
+ *   - clears terminal on exit
  *
- * Keys:
- *   Ctrl-T menu (F10 also works if available)
- *   Ctrl-O open
- *   Ctrl-S save
- *   Ctrl-A save as
- *   Ctrl-F find
- *   F3 find next
- *   Ctrl-K cut line
- *   Ctrl-Y copy line
- *   Ctrl-U paste line
- *   Ctrl-G help
- *   Ctrl-Q quit
+ * Key bindings:
+ *   Ctrl-T  menu
+ *   Ctrl-O  open
+ *   Ctrl-S  save
+ *   Ctrl-A  save as
+ *   Ctrl-F  find
+ *   Ctrl-H  replace
+ *   Ctrl-L  goto line
+ *   Ctrl-Z  undo
+ *   Ctrl-R  redo
+ *   Ctrl-B  toggle selection
+ *   Ctrl-C  copy selection (or current line if no selection)
+ *   Ctrl-X  cut selection (or current line if no selection)
+ *   Ctrl-V  paste text
+ *   Ctrl-G  help
+ *   Ctrl-Q  quit
  */
 
 #include <stdio.h>
@@ -41,45 +47,30 @@
 #define NAME_LEN    1024
 #define STATUS_LEN  1024
 #define SEARCH_LEN  256
+#define CLIP_LEN    65536
+#define UNDO_DEPTH  64
 
 #define CTRL_KEY(x) ((x) & 0x1f)
 
-#define CP_NORMAL   1
-#define CP_KEYWORD  2
-#define CP_STRING   3
-#define CP_COMMENT  4
-#define CP_NUMBER   5
-#define CP_PREPROC  6
-#define CP_LINENO   7
-#define CP_STATUS   8
-#define CP_MENU     9
+#define CP_NORMAL    1
+#define CP_KEYWORD   2
+#define CP_STRING    3
+#define CP_COMMENT   4
+#define CP_NUMBER    5
+#define CP_PREPROC   6
+#define CP_LINENO    7
+#define CP_STATUS    8
+#define CP_MENU      9
 #define CP_MENU_SEL 10
+#define CP_SELECT   11
+#define CP_MATCH    12
 
-static char *lines[MAX_LINES];
-static int nlines = 1;
-static int cy = 0, cx = 0;
-static int rowoff = 0, coloff = 0;
-static int modified = 0;
-static int quit_armed = 0;
-static int tab_width = 4;
-static int use_color = 0;
-static int syntax_enabled = 1;
-static int line_numbers = 1;
-
-static char filename[NAME_LEN];
-static char statusmsg[STATUS_LEN];
-static char last_search[SEARCH_LEN];
-static char *line_clipboard = NULL;
-
-static const char *c_keywords[] = {
-    "auto","break","case","char","const","continue","default","do",
-    "double","else","enum","extern","float","for","goto","if","int",
-    "long","register","return","short","signed","sizeof","static",
-    "struct","switch","typedef","union","unsigned","void","volatile",
-    "while","class","namespace","template","public","private","protected",
-    "virtual","bool","true","false","new","delete","this","try","catch",
-    0
-};
+typedef struct {
+    char **lines;
+    int nlines;
+    int cy, cx;
+    int rowoff, coloff;
+} Snapshot;
 
 typedef struct {
     const char *label;
@@ -92,11 +83,15 @@ enum {
     ACT_SAVE,
     ACT_SAVE_AS,
     ACT_QUIT,
-    ACT_CUT_LINE,
-    ACT_COPY_LINE,
-    ACT_PASTE_LINE,
+    ACT_UNDO,
+    ACT_REDO,
+    ACT_SELECT,
+    ACT_COPY,
+    ACT_CUT,
+    ACT_PASTE,
     ACT_FIND,
-    ACT_FIND_NEXT,
+    ACT_REPLACE,
+    ACT_GOTO,
     ACT_TOGGLE_SYNTAX,
     ACT_TOGGLE_LINES,
     ACT_TAB2,
@@ -104,6 +99,42 @@ enum {
     ACT_TAB8,
     ACT_HELP,
     ACT_ABOUT
+};
+
+static char *lines[MAX_LINES];
+static int nlines = 1;
+static int cy = 0, cx = 0;
+static int rowoff = 0, coloff = 0;
+static int modified = 0;
+static int quit_armed = 0;
+static int tab_width = 4;
+static int use_color = 0;
+static int ansi_color_fallback = 0;
+static int syntax_enabled = 1;
+static int line_numbers = 1;
+
+static int selecting = 0;
+static int sel_sy = 0, sel_sx = 0;
+
+static char filename[NAME_LEN];
+static char statusmsg[STATUS_LEN];
+static char last_search[SEARCH_LEN];
+
+static char *clipboard = NULL;
+
+static Snapshot undo_stack[UNDO_DEPTH];
+static int undo_count = 0;
+static Snapshot redo_stack[UNDO_DEPTH];
+static int redo_count = 0;
+
+static const char *c_keywords[] = {
+    "auto","break","case","char","const","continue","default","do",
+    "double","else","enum","extern","float","for","goto","if","int",
+    "long","register","return","short","signed","sizeof","static",
+    "struct","switch","typedef","union","unsigned","void","volatile",
+    "while","class","namespace","template","public","private","protected",
+    "virtual","bool","true","false","new","delete","this","try","catch",
+    0
 };
 
 static const MenuItem file_menu[] = {
@@ -115,14 +146,19 @@ static const MenuItem file_menu[] = {
 };
 
 static const MenuItem edit_menu[] = {
-    {"Cut line       ^K", ACT_CUT_LINE},
-    {"Copy line      ^Y", ACT_COPY_LINE},
-    {"Paste line     ^U", ACT_PASTE_LINE}
+    {"Undo           ^Z", ACT_UNDO},
+    {"Redo           ^R", ACT_REDO},
+    {"----------------", ACT_NONE},
+    {"Select         ^B", ACT_SELECT},
+    {"Copy           ^C", ACT_COPY},
+    {"Cut            ^X", ACT_CUT},
+    {"Paste          ^V", ACT_PASTE}
 };
 
 static const MenuItem search_menu[] = {
     {"Find...        ^F", ACT_FIND},
-    {"Find next      F3", ACT_FIND_NEXT}
+    {"Replace...     ^H", ACT_REPLACE},
+    {"Goto line...   ^L", ACT_GOTO}
 };
 
 static const MenuItem options_menu[] = {
@@ -176,6 +212,143 @@ static void free_buffer(void)
     }
 }
 
+static void free_snapshot(Snapshot *s)
+{
+    int i;
+    if (s->lines != NULL) {
+        for (i = 0; i < s->nlines; i++)
+            if (s->lines[i] != NULL)
+                free(s->lines[i]);
+        free(s->lines);
+    }
+    s->lines = NULL;
+    s->nlines = 0;
+}
+
+static int make_snapshot(Snapshot *s)
+{
+    int i;
+
+    s->lines = (char **)malloc(sizeof(char *) * nlines);
+    if (s->lines == NULL)
+        return -1;
+
+    s->nlines = nlines;
+    s->cy = cy;
+    s->cx = cx;
+    s->rowoff = rowoff;
+    s->coloff = coloff;
+
+    for (i = 0; i < nlines; i++) {
+        s->lines[i] = dupstr(lines[i]);
+        if (s->lines[i] == NULL) {
+            int j;
+            for (j = 0; j < i; j++)
+                free(s->lines[j]);
+            free(s->lines);
+            s->lines = NULL;
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void restore_snapshot(const Snapshot *s)
+{
+    int i;
+
+    free_buffer();
+
+    nlines = s->nlines;
+    for (i = 0; i < nlines; i++)
+        lines[i] = dupstr(s->lines[i]);
+
+    cy = s->cy;
+    cx = s->cx;
+    rowoff = s->rowoff;
+    coloff = s->coloff;
+    modified = 1;
+    selecting = 0;
+}
+
+static void clear_stack(Snapshot *stack, int *count)
+{
+    int i;
+    for (i = 0; i < *count; i++)
+        free_snapshot(&stack[i]);
+    *count = 0;
+}
+
+static void push_undo(void)
+{
+    int i;
+
+    if (undo_count == UNDO_DEPTH) {
+        free_snapshot(&undo_stack[0]);
+        for (i = 1; i < UNDO_DEPTH; i++)
+            undo_stack[i - 1] = undo_stack[i];
+        undo_count--;
+    }
+
+    if (make_snapshot(&undo_stack[undo_count]) == 0)
+        undo_count++;
+
+    clear_stack(redo_stack, &redo_count);
+}
+
+static void do_undo(void)
+{
+    Snapshot cur;
+
+    if (undo_count <= 0) {
+        set_status("Nothing to undo");
+        return;
+    }
+
+    if (make_snapshot(&cur) == 0) {
+        if (redo_count == UNDO_DEPTH) {
+            free_snapshot(&redo_stack[0]);
+            memmove(&redo_stack[0], &redo_stack[1],
+                    sizeof(Snapshot) * (UNDO_DEPTH - 1));
+            redo_count--;
+        }
+        redo_stack[redo_count++] = cur;
+    }
+
+    undo_count--;
+    restore_snapshot(&undo_stack[undo_count]);
+    free_snapshot(&undo_stack[undo_count]);
+
+    set_status("Undo");
+}
+
+static void do_redo(void)
+{
+    Snapshot cur;
+
+    if (redo_count <= 0) {
+        set_status("Nothing to redo");
+        return;
+    }
+
+    if (make_snapshot(&cur) == 0) {
+        if (undo_count == UNDO_DEPTH) {
+            free_snapshot(&undo_stack[0]);
+            memmove(&undo_stack[0], &undo_stack[1],
+                    sizeof(Snapshot) * (UNDO_DEPTH - 1));
+            undo_count--;
+        }
+        undo_stack[undo_count++] = cur;
+    }
+
+    redo_count--;
+    restore_snapshot(&redo_stack[redo_count]);
+    free_snapshot(&redo_stack[redo_count]);
+
+    set_status("Redo");
+}
+
 static int is_c_file(void)
 {
     const char *p;
@@ -210,6 +383,9 @@ static int load_file(const char *name)
 
         modified = 0;
         cy = cx = rowoff = coloff = 0;
+        selecting = 0;
+        clear_stack(undo_stack, &undo_count);
+        clear_stack(redo_stack, &redo_count);
 
         sprintf(statusmsg, "New file: %s", filename);
         return 0;
@@ -248,6 +424,10 @@ static int load_file(const char *name)
 
     modified = 0;
     cy = cx = rowoff = coloff = 0;
+    selecting = 0;
+    clear_stack(undo_stack, &undo_count);
+    clear_stack(redo_stack, &redo_count);
+
     sprintf(statusmsg, "Loaded %s", filename);
 
     return 0;
@@ -373,6 +553,8 @@ static void smart_tab(void)
 {
     int count;
 
+    push_undo();
+
     count = tab_width - (cx % tab_width);
     if (count <= 0)
         count = tab_width;
@@ -410,6 +592,8 @@ static void smart_outdent_for_brace(void)
 
 static void insert_char(int ch)
 {
+    push_undo();
+
     if (ch == '}' && prefix_is_whitespace(lines[cy], cx))
         smart_outdent_for_brace();
 
@@ -423,6 +607,8 @@ static void delete_backward(void)
 {
     char *line;
     int len;
+
+    push_undo();
 
     line = lines[cy];
     len = (int)strlen(line);
@@ -487,6 +673,8 @@ static void delete_forward(void)
     char *line;
     int len;
 
+    push_undo();
+
     line = lines[cy];
     len = (int)strlen(line);
 
@@ -540,6 +728,8 @@ static void insert_newline(void)
     if (nlines >= MAX_LINES)
         return;
 
+    push_undo();
+
     line = lines[cy];
     len = (int)strlen(line);
 
@@ -580,78 +770,237 @@ static void insert_newline(void)
     modified = 1;
 }
 
-static void copy_current_line(void)
+static void normalize_selection(int *sy, int *sx, int *ey, int *ex)
 {
-    if (line_clipboard != NULL)
-        free(line_clipboard);
+    if (!selecting) {
+        *sy = *ey = cy;
+        *sx = 0;
+        *ex = (int)strlen(lines[cy]);
+        return;
+    }
 
-    line_clipboard = dupstr(lines[cy]);
-
-    if (line_clipboard != NULL)
-        set_status("Line copied");
+    if (sel_sy < cy || (sel_sy == cy && sel_sx <= cx)) {
+        *sy = sel_sy; *sx = sel_sx;
+        *ey = cy;     *ex = cx;
+    } else {
+        *sy = cy;     *sx = cx;
+        *ey = sel_sy; *ex = sel_sx;
+    }
 }
 
-static void cut_current_line(void)
+static int pos_selected(int row, int col)
 {
-    int i;
+    int sy, sx, ey, ex;
 
-    copy_current_line();
+    if (!selecting)
+        return 0;
 
-    if (nlines == 1) {
-        free(lines[0]);
-        lines[0] = dupstr("");
-        cx = 0;
-        modified = 1;
-        set_status("Line cut");
-        return;
-    }
+    normalize_selection(&sy, &sx, &ey, &ex);
 
-    free(lines[cy]);
+    if (row < sy || row > ey)
+        return 0;
 
-    for (i = cy; i < nlines - 1; i++)
-        lines[i] = lines[i + 1];
+    if (sy == ey)
+        return row == sy && col >= sx && col < ex;
 
-    lines[nlines - 1] = NULL;
-    nlines--;
+    if (row == sy)
+        return col >= sx;
+    if (row == ey)
+        return col < ex;
 
-    if (cy >= nlines)
-        cy = nlines - 1;
-
-    if (cx > (int)strlen(lines[cy]))
-        cx = (int)strlen(lines[cy]);
-
-    modified = 1;
-    set_status("Line cut");
+    return 1;
 }
 
-static void paste_line(void)
+static void set_clipboard_text(const char *s)
 {
-    int i;
+    if (clipboard != NULL)
+        free(clipboard);
 
-    if (line_clipboard == NULL) {
-        set_status("Clipboard is empty");
-        return;
-    }
+    clipboard = dupstr(s);
+}
 
-    if (nlines >= MAX_LINES) {
-        set_status("Too many lines");
-        return;
-    }
+static void copy_selection_or_line(void)
+{
+    int sy, sx, ey, ex;
+    int size;
+    int row;
+    char *buf;
+    int pos;
 
-    for (i = nlines; i > cy + 1; i--)
-        lines[i] = lines[i - 1];
+    normalize_selection(&sy, &sx, &ey, &ex);
 
-    lines[cy + 1] = dupstr(line_clipboard);
-    if (lines[cy + 1] == NULL) {
+    size = 1;
+    for (row = sy; row <= ey; row++)
+        size += (int)strlen(lines[row]) + 1;
+
+    buf = (char *)malloc(size);
+    if (buf == NULL) {
         set_status("Out of memory");
         return;
     }
 
-    nlines++;
-    cy++;
-    cx = 0;
+    pos = 0;
+
+    for (row = sy; row <= ey; row++) {
+        int start;
+        int end;
+        int len;
+
+        start = 0;
+        end = (int)strlen(lines[row]);
+
+        if (row == sy)
+            start = sx;
+        if (row == ey)
+            end = ex;
+
+        if (end < start)
+            end = start;
+
+        len = end - start;
+
+        if (len > 0) {
+            memcpy(buf + pos, lines[row] + start, len);
+            pos += len;
+        }
+
+        if (row < ey)
+            buf[pos++] = '\n';
+    }
+
+    buf[pos] = '\0';
+    set_clipboard_text(buf);
+    free(buf);
+
+    set_status(selecting ? "Selection copied" : "Line copied");
+}
+
+static void delete_selection(void)
+{
+    int sy, sx, ey, ex;
+
+    if (!selecting)
+        return;
+
+    normalize_selection(&sy, &sx, &ey, &ex);
+
+    push_undo();
+
+    if (sy == ey) {
+        char *line = lines[sy];
+        int len = (int)strlen(line);
+
+        memmove(line + sx, line + ex, len - ex + 1);
+        cy = sy;
+        cx = sx;
+    } else {
+        char *newfirst;
+        int tail_len;
+        int i;
+        int remove_count;
+
+        tail_len = (int)strlen(lines[ey]) - ex;
+
+        newfirst = (char *)malloc(sx + tail_len + 1);
+        if (newfirst == NULL)
+            return;
+
+        memcpy(newfirst, lines[sy], sx);
+        strcpy(newfirst + sx, lines[ey] + ex);
+
+        free(lines[sy]);
+
+        for (i = sy + 1; i <= ey; i++)
+            free(lines[i]);
+
+        lines[sy] = newfirst;
+
+        remove_count = ey - sy;
+
+        for (i = sy + 1; i + remove_count < nlines; i++)
+            lines[i] = lines[i + remove_count];
+
+        for (; i < nlines; i++)
+            lines[i] = NULL;
+
+        nlines -= remove_count;
+        cy = sy;
+        cx = sx;
+    }
+
+    selecting = 0;
     modified = 1;
-    set_status("Line pasted");
+}
+
+static void cut_selection_or_line(void)
+{
+    if (selecting) {
+        copy_selection_or_line();
+        delete_selection();
+        set_status("Selection cut");
+    } else {
+        selecting = 1;
+        sel_sy = cy;
+        sel_sx = 0;
+        cx = (int)strlen(lines[cy]);
+        copy_selection_or_line();
+        delete_selection();
+        set_status("Line cut");
+    }
+}
+
+static void paste_text(void)
+{
+    char *copy;
+    char *p;
+    char *seg;
+    int first;
+
+    if (clipboard == NULL) {
+        set_status("Clipboard empty");
+        return;
+    }
+
+    push_undo();
+
+    if (selecting)
+        delete_selection();
+
+    copy = dupstr(clipboard);
+    if (copy == NULL)
+        return;
+
+    p = copy;
+    first = 1;
+
+    while ((seg = strchr(p, '\n')) != NULL) {
+        int i;
+
+        *seg = '\0';
+
+        if (!first)
+            insert_newline();
+
+        for (i = 0; p[i] != '\0'; i++)
+            insert_char_at(cy, cx++, p[i]);
+
+        modified = 1;
+        p = seg + 1;
+        first = 0;
+    }
+
+    if (!first)
+        insert_newline();
+
+    {
+        int i;
+        for (i = 0; p[i] != '\0'; i++)
+            insert_char_at(cy, cx++, p[i]);
+    }
+
+    modified = 1;
+    free(copy);
+    set_status("Pasted");
 }
 
 static void scroll_screen(void)
@@ -750,7 +1099,135 @@ static int scan_block_comment_state_to(int upto_row)
     return in_comment;
 }
 
-static void draw_c_line(int y, const char *s, int *block_comment, int gutter)
+static int bracket_match_row = -1;
+static int bracket_match_col = -1;
+
+static int matching_bracket(char c)
+{
+    switch (c) {
+    case '(': return ')';
+    case ')': return '(';
+    case '[': return ']';
+    case ']': return '[';
+    case '{': return '}';
+    case '}': return '{';
+    }
+    return 0;
+}
+
+static int bracket_dir(char c)
+{
+    if (c == '(' || c == '[' || c == '{')
+        return 1;
+    if (c == ')' || c == ']' || c == '}')
+        return -1;
+    return 0;
+}
+
+static void compute_bracket_match(void)
+{
+    char c;
+    int target;
+    int dir;
+    int depth;
+    int r, cidx;
+
+    bracket_match_row = -1;
+    bracket_match_col = -1;
+
+    if (cy < 0 || cy >= nlines)
+        return;
+
+    if (cx < (int)strlen(lines[cy]))
+        c = lines[cy][cx];
+    else if (cx > 0)
+        c = lines[cy][cx - 1];
+    else
+        return;
+
+    target = matching_bracket(c);
+    dir = bracket_dir(c);
+
+    if (!target || !dir)
+        return;
+
+    depth = 0;
+
+    if (dir > 0) {
+        for (r = cy; r < nlines; r++) {
+            int start = (r == cy ? cx + 1 : 0);
+            for (cidx = start; cidx < (int)strlen(lines[r]); cidx++) {
+                char x = lines[r][cidx];
+                if (x == c) depth++;
+                else if (x == target) {
+                    if (depth == 0) {
+                        bracket_match_row = r;
+                        bracket_match_col = cidx;
+                        return;
+                    }
+                    depth--;
+                }
+            }
+        }
+    } else {
+        for (r = cy; r >= 0; r--) {
+            int start = (r == cy ? cx - 1 : (int)strlen(lines[r]) - 1);
+            for (cidx = start; cidx >= 0; cidx--) {
+                char x = lines[r][cidx];
+                if (x == c) depth++;
+                else if (x == target) {
+                    if (depth == 0) {
+                        bracket_match_row = r;
+                        bracket_match_col = cidx;
+                        return;
+                    }
+                    depth--;
+                }
+            }
+        }
+    }
+}
+
+static void draw_char_with_attrs(int y, int x, int row, int col, int ch, int pair)
+{
+    int selected;
+    int matched;
+
+    selected = pos_selected(row, col);
+    matched = (row == bracket_match_row && col == bracket_match_col);
+
+    if (use_color) {
+        if (selected)
+            attron(COLOR_PAIR(CP_SELECT));
+        else if (matched)
+            attron(COLOR_PAIR(CP_MATCH));
+        else
+            attron(COLOR_PAIR(pair));
+    } else {
+        if (selected)
+            attron(A_REVERSE);
+        else if (matched)
+            attron(A_BOLD | A_REVERSE);
+    }
+
+    mvaddch(y, x, ch);
+
+    if (use_color) {
+        if (selected)
+            attroff(COLOR_PAIR(CP_SELECT));
+        else if (matched)
+            attroff(COLOR_PAIR(CP_MATCH));
+        else
+            attroff(COLOR_PAIR(pair));
+    } else {
+        if (selected)
+            attroff(A_REVERSE);
+        else if (matched)
+            attroff(A_BOLD | A_REVERSE);
+    }
+}
+
+static void draw_c_line(int y, int row, const char *s, int *block_comment, int gutter)
 {
     int i;
     int len;
@@ -783,7 +1260,6 @@ static void draw_c_line(int y, const char *s, int *block_comment, int gutter)
             pair = CP_COMMENT;
             *block_comment = 1;
             i += 2;
-
             while (i < len) {
                 if (s[i] == '*' && i + 1 < len && s[i + 1] == '/') {
                     i += 2;
@@ -797,7 +1273,159 @@ static void draw_c_line(int y, const char *s, int *block_comment, int gutter)
             i = len;
         } else if (s[i] == '"' || s[i] == '\'') {
             int q;
+            q = s[i++];
+            pair = CP_STRING;
+            while (i < len) {
+                if (s[i] == '\\' && i + 1 < len)
+                    i += 2;
+                else if (s[i] == q) {
+                    i++;
+                    break;
+                } else {
+                    i++;
+                }
+            }
+        } else if (s[i] == '#' && prefix_is_whitespace(s, i)) {
+            pair = CP_PREPROC;
+            i = len;
+        } else if (isdigit((unsigned char)s[i])) {
+            pair = CP_NUMBER;
+            i++;
+            while (i < len &&
+                  (isalnum((unsigned char)s[i]) ||
+                   s[i] == '.' || s[i] == 'x' || s[i] == 'X'))
+                i++;
+        } else if (isalpha((unsigned char)s[i]) || s[i] == '_') {
+            i++;
+            while (i < len &&
+                  (isalnum((unsigned char)s[i]) || s[i] == '_'))
+                i++;
+            if (is_keyword(s + start, i - start))
+                pair = CP_KEYWORD;
+        } else {
+            i++;
+        }
 
+        {
+            int j;
+            int ds = start < visible_start ? visible_start : start;
+            int de = i > visible_end ? visible_end : i;
+
+            for (j = ds; j < de; j++)
+                draw_char_with_attrs(y,
+                                     gutter + (j - visible_start),
+                                     row,
+                                     j,
+                                     s[j],
+                                     pair);
+        }
+    }
+}
+
+static void draw_plain_line(int y, int row, const char *s, int gutter)
+{
+    int len;
+    int j;
+    int start;
+    int end;
+
+    len = (int)strlen(s);
+    start = coloff;
+    end = coloff + (COLS - gutter - 1);
+
+    if (start > len)
+        return;
+    if (end > len)
+        end = len;
+
+    for (j = start; j < end; j++)
+        draw_char_with_attrs(y, gutter + (j - start), row, j, s[j], CP_NORMAL);
+}
+
+
+static const char *ansi_sgr_for_pair(int pair)
+{
+    switch (pair) {
+    case CP_KEYWORD: return "36";   /* cyan */
+    case CP_STRING:  return "33";   /* yellow */
+    case CP_COMMENT: return "32";   /* green */
+    case CP_NUMBER:  return "35";   /* magenta */
+    case CP_PREPROC: return "34";   /* blue */
+    default:         return NULL;
+    }
+}
+
+/*
+ * IRIX curses may report no colour support even when the terminal's
+ * terminfo entry says colours=8.  In that case, draw the normal curses
+ * screen first and then overlay syntax-coloured token spans using ANSI
+ * SGR + absolute cursor positioning.
+ */
+static void ansi_overlay_span(int screen_y, int screen_x,
+                              const char *s, int len, int pair)
+{
+    const char *code;
+
+    if (len <= 0)
+        return;
+
+    code = ansi_sgr_for_pair(pair);
+    if (code == NULL)
+        return;
+
+    printf("\033[%d;%dH\033[%sm", screen_y + 1, screen_x + 1, code);
+    fwrite(s, 1, len, stdout);
+    printf("\033[0m");
+}
+
+static void ansi_overlay_c_line(int screen_y, int row,
+                                const char *s, int *block_comment,
+                                int gutter)
+{
+    int i;
+    int len;
+    int visible_start;
+    int visible_end;
+
+    i = 0;
+    len = (int)strlen(s);
+    visible_start = coloff;
+    visible_end = coloff + (COLS - gutter - 1);
+
+    while (i < len) {
+        int start;
+        int pair;
+
+        start = i;
+        pair = CP_NORMAL;
+
+        if (*block_comment) {
+            pair = CP_COMMENT;
+            while (i < len) {
+                if (s[i] == '*' && i + 1 < len && s[i + 1] == '/') {
+                    i += 2;
+                    *block_comment = 0;
+                    break;
+                }
+                i++;
+            }
+        } else if (s[i] == '/' && i + 1 < len && s[i + 1] == '*') {
+            pair = CP_COMMENT;
+            *block_comment = 1;
+            i += 2;
+            while (i < len) {
+                if (s[i] == '*' && i + 1 < len && s[i + 1] == '/') {
+                    i += 2;
+                    *block_comment = 0;
+                    break;
+                }
+                i++;
+            }
+        } else if (s[i] == '/' && i + 1 < len && s[i + 1] == '/') {
+            pair = CP_COMMENT;
+            i = len;
+        } else if (s[i] == '"' || s[i] == '\'') {
+            int q;
             q = s[i++];
             pair = CP_STRING;
 
@@ -817,14 +1445,12 @@ static void draw_c_line(int y, const char *s, int *block_comment, int gutter)
         } else if (isdigit((unsigned char)s[i])) {
             pair = CP_NUMBER;
             i++;
-
             while (i < len &&
                   (isalnum((unsigned char)s[i]) ||
                    s[i] == '.' || s[i] == 'x' || s[i] == 'X'))
                 i++;
         } else if (isalpha((unsigned char)s[i]) || s[i] == '_') {
             i++;
-
             while (i < len &&
                   (isalnum((unsigned char)s[i]) || s[i] == '_'))
                 i++;
@@ -835,7 +1461,8 @@ static void draw_c_line(int y, const char *s, int *block_comment, int gutter)
             i++;
         }
 
-        if (i > visible_start && start < visible_end) {
+        if (pair != CP_NORMAL &&
+            i > visible_start && start < visible_end) {
             int ds;
             int de;
 
@@ -843,19 +1470,72 @@ static void draw_c_line(int y, const char *s, int *block_comment, int gutter)
             de = i > visible_end ? visible_end : i;
 
             if (de > ds) {
-                if (use_color)
-                    attron(COLOR_PAIR(pair));
+                int j;
+                int run_start;
 
-                mvaddnstr(y,
-                          gutter + (ds - visible_start),
-                          s + ds,
-                          de - ds);
+                /*
+                 * Do not paint over selected cells; keep curses reverse
+                 * highlighting visible.  Emit contiguous non-selected runs.
+                 */
+                j = ds;
+                while (j < de) {
+                    while (j < de && pos_selected(row, j))
+                        j++;
 
-                if (use_color)
-                    attroff(COLOR_PAIR(pair));
+                    run_start = j;
+
+                    while (j < de && !pos_selected(row, j))
+                        j++;
+
+                    if (j > run_start) {
+                        ansi_overlay_span(
+                            screen_y,
+                            gutter + (run_start - visible_start),
+                            s + run_start,
+                            j - run_start,
+                            pair
+                        );
+                    }
+                }
             }
         }
     }
+}
+
+static void ansi_overlay_syntax(void)
+{
+    int y;
+    int filerow;
+    int textrows;
+    int gutter;
+    int block_comment;
+
+    if (!ansi_color_fallback || !syntax_enabled || !is_c_file())
+        return;
+
+    gutter = line_numbers ? 6 : 0;
+    textrows = LINES - 3;
+    if (textrows < 1)
+        textrows = 1;
+
+    block_comment = scan_block_comment_state_to(rowoff);
+
+    for (y = 0; y < textrows; y++) {
+        filerow = rowoff + y;
+
+        if (filerow >= nlines)
+            break;
+
+        ansi_overlay_c_line(y + 1, filerow, lines[filerow],
+                            &block_comment, gutter);
+    }
+
+    /* Restore default attributes and place the cursor back in the editor. */
+    printf("\033[0m");
+    printf("\033[%d;%dH",
+           (cy - rowoff) + 2,
+           gutter + cx - coloff + 1);
+    fflush(stdout);
 }
 
 static void draw_screen(void)
@@ -869,6 +1549,7 @@ static void draw_screen(void)
     int name_room;
 
     scroll_screen();
+    compute_bracket_match();
     erase();
 
     if (use_color)
@@ -886,7 +1567,6 @@ static void draw_screen(void)
 
     gutter = line_numbers ? 6 : 0;
     textrows = LINES - 3;
-
     if (textrows < 1)
         textrows = 1;
 
@@ -915,19 +1595,10 @@ static void draw_screen(void)
         if (filerow >= nlines)
             continue;
 
-        if (syntax_enabled && is_c_file() && use_color) {
-            draw_c_line(y + 1, lines[filerow], &block_comment, gutter);
-        } else {
-            int len;
-
-            len = (int)strlen(lines[filerow]);
-
-            if (coloff < len)
-                mvaddnstr(y + 1,
-                          gutter,
-                          lines[filerow] + coloff,
-                          COLS - gutter - 1);
-        }
+        if (syntax_enabled && is_c_file() && use_color)
+            draw_c_line(y + 1, filerow, lines[filerow], &block_comment, gutter);
+        else
+            draw_plain_line(y + 1, filerow, lines[filerow], gutter);
     }
 
     if (use_color)
@@ -935,14 +1606,15 @@ static void draw_screen(void)
     else
         attron(A_REVERSE);
 
-    name_room = COLS - 42;
+    name_room = COLS - 48;
     if (name_room < 10)
         name_room = 10;
 
-    sprintf(buf, " %-*.*s %s  Ln %d/%d Col %d  TAB:%d  %s ",
+    sprintf(buf, " %-*.*s %s %s Ln %d/%d Col %d TAB:%d %s ",
             name_room, name_room,
             filename[0] ? filename : "[No Name]",
             modified ? "[+]" : "",
+            selecting ? "[SEL]" : "",
             cy + 1, nlines, cx + 1, tab_width,
             syntax_enabled ? "SYN" : "TXT");
 
@@ -955,11 +1627,10 @@ static void draw_screen(void)
         attroff(A_REVERSE);
 
     mvaddstr(LINES - 1, 0,
-             "^T Menu  ^O Open  ^S Save  ^F Find  ^K Cut  ^U Paste  ^Q Quit");
+             "^T Menu ^S Save ^F Find ^H Repl ^B Sel ^Z Undo ^Q Quit");
 
     if (statusmsg[0] != '\0') {
         int pos;
-
         pos = COLS - (int)strlen(statusmsg) - 1;
         if (pos > 0)
             mvaddnstr(LINES - 1, pos, statusmsg, COLS - pos);
@@ -969,6 +1640,9 @@ static void draw_screen(void)
          gutter + cx - coloff);
 
     refresh();
+
+    if (ansi_color_fallback)
+        ansi_overlay_syntax();
 }
 
 static int prompt_input(const char *prompt, char *out, int outlen)
@@ -982,7 +1656,7 @@ static int prompt_input(const char *prompt, char *out, int outlen)
     for (;;) {
         move(LINES - 1, 0);
         clrtoeol();
-        mvaddstr(LINES - 1, 0, prompt);
+        mvaddstr(LINES - 1, 0, (char *)prompt);
         addnstr(out, COLS - (int)strlen(prompt) - 1);
         refresh();
 
@@ -1102,39 +1776,147 @@ static void do_find(void)
         sprintf(statusmsg, "Not found: %s", last_search);
 }
 
-static void find_next(void)
+static void do_replace(void)
 {
-    if (!last_search[0]) {
-        set_status("No previous search");
+    char findbuf[SEARCH_LEN];
+    char replbuf[SEARCH_LEN];
+    char mode[16];
+
+    if (!prompt_input("Find: ", findbuf, sizeof(findbuf)) || !findbuf[0]) {
+        set_status("Replace cancelled");
         return;
     }
 
-    if (find_from_position(last_search, cy, cx + 1))
-        sprintf(statusmsg, "Found: %s", last_search);
-    else
-        sprintf(statusmsg, "Not found: %s", last_search);
+    if (!prompt_input("Replace with: ", replbuf, sizeof(replbuf))) {
+        set_status("Replace cancelled");
+        return;
+    }
+
+    if (!prompt_input("Mode [1=next, a=all]: ", mode, sizeof(mode))) {
+        set_status("Replace cancelled");
+        return;
+    }
+
+    push_undo();
+
+    if (mode[0] == 'a' || mode[0] == 'A') {
+        int row;
+        int count;
+
+        count = 0;
+
+        for (row = 0; row < nlines; row++) {
+            char *p;
+
+            while ((p = strstr(lines[row], findbuf)) != NULL) {
+                int prelen;
+                int newlen;
+                char *newp;
+
+                prelen = (int)(p - lines[row]);
+                newlen = (int)strlen(lines[row])
+                       - (int)strlen(findbuf)
+                       + (int)strlen(replbuf);
+
+                if (newlen >= MAX_LINE - 1)
+                    break;
+
+                newp = (char *)malloc(newlen + 1);
+                if (newp == NULL)
+                    break;
+
+                memcpy(newp, lines[row], prelen);
+                strcpy(newp + prelen, replbuf);
+                strcpy(newp + prelen + strlen(replbuf),
+                       p + strlen(findbuf));
+
+                free(lines[row]);
+                lines[row] = newp;
+                count++;
+            }
+        }
+
+        modified = 1;
+        sprintf(statusmsg, "Replaced %d occurrence(s)", count);
+    } else {
+        if (find_from_position(findbuf, cy, cx)) {
+            char *line;
+            int oldlen, flen, rlen;
+            char *newp;
+
+            line = lines[cy];
+            oldlen = (int)strlen(line);
+            flen = (int)strlen(findbuf);
+            rlen = (int)strlen(replbuf);
+
+            if (oldlen - flen + rlen < MAX_LINE - 1) {
+                newp = (char *)malloc(oldlen - flen + rlen + 1);
+                if (newp != NULL) {
+                    memcpy(newp, line, cx);
+                    memcpy(newp + cx, replbuf, rlen);
+                    strcpy(newp + cx + rlen, line + cx + flen);
+
+                    free(line);
+                    lines[cy] = newp;
+                    modified = 1;
+                    set_status("Replaced next occurrence");
+                }
+            }
+        } else {
+            set_status("Text not found");
+        }
+    }
+}
+
+static void do_goto(void)
+{
+    char buf[32];
+    int line;
+
+    if (!prompt_input("Goto line: ", buf, sizeof(buf)) || !buf[0]) {
+        set_status("Goto cancelled");
+        return;
+    }
+
+    line = atoi(buf);
+
+    if (line < 1)
+        line = 1;
+    if (line > nlines)
+        line = nlines;
+
+    cy = line - 1;
+
+    if (cx > (int)strlen(lines[cy]))
+        cx = (int)strlen(lines[cy]);
+
+    scroll_screen();
+    sprintf(statusmsg, "Line %d", line);
 }
 
 static void help_screen(void)
 {
     erase();
 
-    mvaddstr(1, 2, "TEDIT v3 - portable curses editor");
-    mvaddstr(3, 2, "Ctrl-T       Open menu bar");
+    mvaddstr(1, 2, "TEDIT v4 - portable curses editor");
+    mvaddstr(3, 2, "Ctrl-T       Menu bar");
     mvaddstr(4, 2, "Ctrl-O       Open");
     mvaddstr(5, 2, "Ctrl-S       Save");
     mvaddstr(6, 2, "Ctrl-A       Save As");
     mvaddstr(7, 2, "Ctrl-F       Find");
-    mvaddstr(8, 2, "F3           Find next");
-    mvaddstr(9, 2, "Ctrl-K       Cut current line");
-    mvaddstr(10, 2, "Ctrl-Y       Copy current line");
-    mvaddstr(11, 2, "Ctrl-U       Paste line below");
-    mvaddstr(12, 2, "Ctrl-Q       Quit");
-    mvaddstr(14, 2, "Tab          Spaces to next tab stop");
-    mvaddstr(15, 2, "Enter        Smart-indent new line");
-    mvaddstr(16, 2, "}            Auto-outdent in leading whitespace");
-    mvaddstr(17, 2, "Backspace    Smart unindent in leading whitespace");
-    mvaddstr(19, 2, "Press any key.");
+    mvaddstr(8, 2, "Ctrl-H       Replace");
+    mvaddstr(9, 2, "Ctrl-L       Goto line");
+    mvaddstr(10, 2, "Ctrl-Z       Undo");
+    mvaddstr(11, 2, "Ctrl-R       Redo");
+    mvaddstr(12, 2, "Ctrl-B       Start/stop selection");
+    mvaddstr(13, 2, "Ctrl-C       Copy selection/current line");
+    mvaddstr(14, 2, "Ctrl-X       Cut selection/current line");
+    mvaddstr(15, 2, "Ctrl-V       Paste");
+    mvaddstr(16, 2, "Ctrl-Q       Quit");
+    mvaddstr(18, 2, "Tab          Spaces to next tab stop");
+    mvaddstr(19, 2, "Enter        Smart-indent new line");
+    mvaddstr(20, 2, "}            Auto-outdent in leading whitespace");
+    mvaddstr(22, 2, "Press any key.");
 
     refresh();
     getch();
@@ -1144,8 +1926,8 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v3");
-    mvaddstr(4, 4, "A small portable curses editor for classic UNIX systems.");
+    mvaddstr(2, 4, "TEDIT v4");
+    mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
 
@@ -1165,14 +1947,15 @@ static void quit_editor(void)
     refresh();
     endwin();
 
-    /* Clear the terminal after leaving curses. */
     printf("\033[2J\033[H");
     fflush(stdout);
 
     free_buffer();
+    clear_stack(undo_stack, &undo_count);
+    clear_stack(redo_stack, &redo_count);
 
-    if (line_clipboard != NULL)
-        free(line_clipboard);
+    if (clipboard != NULL)
+        free(clipboard);
 
     exit(0);
 }
@@ -1180,33 +1963,27 @@ static void quit_editor(void)
 static void execute_action(int action)
 {
     switch (action) {
-    case ACT_OPEN:
-        do_open();
+    case ACT_OPEN: do_open(); break;
+    case ACT_SAVE: do_save(); break;
+    case ACT_SAVE_AS: do_save_as(); break;
+    case ACT_QUIT: quit_editor(); break;
+    case ACT_UNDO: do_undo(); break;
+    case ACT_REDO: do_redo(); break;
+    case ACT_SELECT:
+        selecting = !selecting;
+        if (selecting) {
+            sel_sy = cy; sel_sx = cx;
+            set_status("Selection started");
+        } else {
+            set_status("Selection cleared");
+        }
         break;
-    case ACT_SAVE:
-        do_save();
-        break;
-    case ACT_SAVE_AS:
-        do_save_as();
-        break;
-    case ACT_QUIT:
-        quit_editor();
-        break;
-    case ACT_CUT_LINE:
-        cut_current_line();
-        break;
-    case ACT_COPY_LINE:
-        copy_current_line();
-        break;
-    case ACT_PASTE_LINE:
-        paste_line();
-        break;
-    case ACT_FIND:
-        do_find();
-        break;
-    case ACT_FIND_NEXT:
-        find_next();
-        break;
+    case ACT_COPY: copy_selection_or_line(); break;
+    case ACT_CUT: cut_selection_or_line(); break;
+    case ACT_PASTE: paste_text(); break;
+    case ACT_FIND: do_find(); break;
+    case ACT_REPLACE: do_replace(); break;
+    case ACT_GOTO: do_goto(); break;
     case ACT_TOGGLE_SYNTAX:
         syntax_enabled = !syntax_enabled;
         set_status(syntax_enabled ? "Syntax highlighting on" :
@@ -1217,25 +1994,14 @@ static void execute_action(int action)
         set_status(line_numbers ? "Line numbers on" : "Line numbers off");
         break;
     case ACT_TAB2:
-        tab_width = 2;
-        set_status("Tab width set to 2");
-        break;
+        tab_width = 2; set_status("Tab width 2"); break;
     case ACT_TAB4:
-        tab_width = 4;
-        set_status("Tab width set to 4");
-        break;
+        tab_width = 4; set_status("Tab width 4"); break;
     case ACT_TAB8:
-        tab_width = 8;
-        set_status("Tab width set to 8");
-        break;
-    case ACT_HELP:
-        help_screen();
-        break;
-    case ACT_ABOUT:
-        about_screen();
-        break;
-    default:
-        break;
+        tab_width = 8; set_status("Tab width 8"); break;
+    case ACT_HELP: help_screen(); break;
+    case ACT_ABOUT: about_screen(); break;
+    default: break;
     }
 }
 
@@ -1279,12 +2045,9 @@ static int menu_x_position(int menu_index)
 static int first_selectable(const MenuItem *items, int count)
 {
     int i;
-
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < count; i++)
         if (items[i].action != ACT_NONE)
             return i;
-    }
-
     return 0;
 }
 
@@ -1436,6 +2199,7 @@ static void activate_menu(void)
         draw_menu_bar_selected(menu_index);
 
         items = get_menu(menu_index, &count);
+
         if (item_index >= count || items[item_index].action == ACT_NONE)
             item_index = first_selectable(items, count);
 
@@ -1447,23 +2211,16 @@ static void activate_menu(void)
         if (ch == 27)
             break;
 
-#ifdef KEY_F
-        if (ch == KEY_F(10))
-            break;
-#endif
-
         if (ch == KEY_LEFT) {
             menu_index--;
             if (menu_index < 0)
                 menu_index = 4;
-
             items = get_menu(menu_index, &count);
             item_index = first_selectable(items, count);
         } else if (ch == KEY_RIGHT) {
             menu_index++;
             if (menu_index > 4)
                 menu_index = 0;
-
             items = get_menu(menu_index, &count);
             item_index = first_selectable(items, count);
         } else if (ch == KEY_UP) {
@@ -1472,7 +2229,6 @@ static void activate_menu(void)
             item_index = next_selectable(items, count, item_index, 1);
         } else if (ch == '\n' || ch == '\r') {
             int action;
-
             action = items[item_index].action;
             if (action != ACT_NONE) {
                 execute_action(action);
@@ -1498,17 +2254,19 @@ static void process_key(int ch)
         return;
     }
 
-#ifdef KEY_F
-    if (ch == KEY_F(10)) {
-        activate_menu();
+    /*
+     * IRIX curses may define KEY_BACKSPACE as the same numeric value as
+     * ASCII backspace (8).  Handle backspace before the switch so we
+     * never create duplicate case labels.
+     */
+    if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+        if (selecting)
+            delete_selection();
+        else
+            delete_backward();
+        scroll_screen();
         return;
     }
-
-    if (ch == KEY_F(3)) {
-        find_next();
-        return;
-    }
-#endif
 
     switch (ch) {
     case CTRL_KEY('q'):
@@ -1531,20 +2289,47 @@ static void process_key(int ch)
         do_find();
         break;
 
+    case CTRL_KEY('h'):
+        do_replace();
+        break;
+
+    case CTRL_KEY('l'):
+        do_goto();
+        break;
+
+    case CTRL_KEY('z'):
+        do_undo();
+        break;
+
+    case CTRL_KEY('r'):
+        do_redo();
+        break;
+
+    case CTRL_KEY('b'):
+        selecting = !selecting;
+        if (selecting) {
+            sel_sy = cy;
+            sel_sx = cx;
+            set_status("Selection started");
+        } else {
+            set_status("Selection cleared");
+        }
+        break;
+
+    case CTRL_KEY('c'):
+        copy_selection_or_line();
+        break;
+
+    case CTRL_KEY('x'):
+        cut_selection_or_line();
+        break;
+
+    case CTRL_KEY('v'):
+        paste_text();
+        break;
+
     case CTRL_KEY('g'):
         help_screen();
-        break;
-
-    case CTRL_KEY('k'):
-        cut_current_line();
-        break;
-
-    case CTRL_KEY('y'):
-        copy_current_line();
-        break;
-
-    case CTRL_KEY('u'):
-        paste_line();
         break;
 
     case KEY_LEFT:
@@ -1568,7 +2353,6 @@ static void process_key(int ch)
     case KEY_UP:
         if (cy > 0)
             cy--;
-
         if (cx > (int)strlen(lines[cy]))
             cx = (int)strlen(lines[cy]);
         break;
@@ -1576,7 +2360,6 @@ static void process_key(int ch)
     case KEY_DOWN:
         if (cy < nlines - 1)
             cy++;
-
         if (cx > (int)strlen(lines[cy]))
             cx = (int)strlen(lines[cy]);
         break;
@@ -1596,10 +2379,8 @@ static void process_key(int ch)
 #ifdef KEY_PPAGE
     case KEY_PPAGE:
         cy -= LINES - 4;
-
         if (cy < 0)
             cy = 0;
-
         if (cx > (int)strlen(lines[cy]))
             cx = (int)strlen(lines[cy]);
         break;
@@ -1608,39 +2389,41 @@ static void process_key(int ch)
 #ifdef KEY_NPAGE
     case KEY_NPAGE:
         cy += LINES - 4;
-
         if (cy >= nlines)
             cy = nlines - 1;
-
         if (cx > (int)strlen(lines[cy]))
             cx = (int)strlen(lines[cy]);
         break;
 #endif
 
-    case KEY_BACKSPACE:
-    case 127:
-    case 8:
-        delete_backward();
-        break;
-
 #ifdef KEY_DC
     case KEY_DC:
-        delete_forward();
+        if (selecting)
+            delete_selection();
+        else
+            delete_forward();
         break;
 #endif
 
     case '\n':
     case '\r':
+        if (selecting)
+            delete_selection();
         insert_newline();
         break;
 
     case '\t':
+        if (selecting)
+            delete_selection();
         smart_tab();
         break;
 
     default:
-        if (ch >= 32 && ch <= 126)
+        if (ch >= 32 && ch <= 126) {
+            if (selecting)
+                delete_selection();
             insert_char(ch);
+        }
         break;
     }
 
@@ -1650,25 +2433,48 @@ static void process_key(int ch)
 static void init_colors_if_possible(void)
 {
     use_color = 0;
+    ansi_color_fallback = 0;
 
 #ifdef COLOR_BLACK
     if (has_colors()) {
-        start_color();
+        if (start_color() != ERR) {
+            init_pair(CP_NORMAL,    COLOR_WHITE,   COLOR_BLACK);
+            init_pair(CP_KEYWORD,   COLOR_CYAN,    COLOR_BLACK);
+            init_pair(CP_STRING,    COLOR_YELLOW,  COLOR_BLACK);
+            init_pair(CP_COMMENT,   COLOR_GREEN,   COLOR_BLACK);
+            init_pair(CP_NUMBER,    COLOR_MAGENTA, COLOR_BLACK);
+            init_pair(CP_PREPROC,   COLOR_BLUE,    COLOR_BLACK);
+            init_pair(CP_LINENO,    COLOR_CYAN,    COLOR_BLACK);
+            init_pair(CP_STATUS,    COLOR_BLACK,   COLOR_CYAN);
+            init_pair(CP_MENU,      COLOR_BLACK,   COLOR_WHITE);
+            init_pair(CP_MENU_SEL,  COLOR_WHITE,   COLOR_BLUE);
+            init_pair(CP_SELECT,    COLOR_BLACK,   COLOR_YELLOW);
+            init_pair(CP_MATCH,     COLOR_BLACK,   COLOR_GREEN);
 
-        init_pair(CP_NORMAL,   COLOR_WHITE,   COLOR_BLACK);
-        init_pair(CP_KEYWORD,  COLOR_CYAN,    COLOR_BLACK);
-        init_pair(CP_STRING,   COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(CP_COMMENT,  COLOR_GREEN,   COLOR_BLACK);
-        init_pair(CP_NUMBER,   COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(CP_PREPROC,  COLOR_BLUE,    COLOR_BLACK);
-        init_pair(CP_LINENO,   COLOR_CYAN,    COLOR_BLACK);
-        init_pair(CP_STATUS,   COLOR_BLACK,   COLOR_CYAN);
-        init_pair(CP_MENU,     COLOR_BLACK,   COLOR_WHITE);
-        init_pair(CP_MENU_SEL, COLOR_WHITE,   COLOR_BLUE);
-
-        use_color = 1;
+            use_color = 1;
+            return;
+        }
     }
 #endif
+
+    /*
+     * SGI IRIX curses can return ERR from start_color()/0 from
+     * has_colors() even when an xterm-compatible remote terminal accepts
+     * ANSI colour sequences.  The ANSI test program confirmed this setup
+     * does, so use the fallback when TERM looks xterm/ansi/vt-like.
+     */
+    {
+        char *term;
+        term = getenv("TERM");
+
+        if (term != NULL &&
+           (strstr(term, "xterm") != NULL ||
+            strstr(term, "ansi")  != NULL ||
+            strstr(term, "vt")    != NULL ||
+            strstr(term, "screen") != NULL)) {
+            ansi_color_fallback = 1;
+        }
+    }
 }
 
 int main(int argc, char **argv)
