@@ -1,0 +1,3 @@
+build=make
+clean=make clean
+run=./tedit
