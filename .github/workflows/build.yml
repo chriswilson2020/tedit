@@ -15,3 +15,15 @@ jobs:
         run: |
           make clean
           make CC=gcc CFLAGS="-std=c89 -Wall -Wextra -pedantic"
+
+      - name: Create IRIX source tarball
+        run: |
+          mkdir -p dist/tedit-7.0.0-irix
+          cp tedit.c syntax.c syntax.h format.c format.h Makefile README.md CHANGELOG.md teditrc.example tedit-project.example dist/tedit-7.0.0-irix/
+          cp -R syntax dist/tedit-7.0.0-irix/
+          tar -czf tedit-7.0.0-irix.tar.gz -C dist tedit-7.0.0-irix
+      - name: Upload IRIX source tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: tedit-7.0.0-irix
+          path: tedit-7.0.0-irix.tar.gz
