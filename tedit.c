@@ -267,6 +267,10 @@ static void set_status(const char *s)
 
 static void clear_stack(Snapshot *stack, int *count);
 static int confirm_yes_no(const char *message);
+static void scroll_screen(void);
+static void compute_bracket_match(void);
+static int bracket_match_row = -1;
+static int bracket_match_col = -1;
 
 static void init_buffer(void)
 {
@@ -1874,9 +1878,6 @@ static void scroll_screen(void)
     if (coloff < 0)
         coloff = 0;
 }
-
-static int bracket_match_row = -1;
-static int bracket_match_col = -1;
 
 static int matching_bracket(char c)
 {
