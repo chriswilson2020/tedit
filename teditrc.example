@@ -6,6 +6,12 @@ linenumbers=on
 syntax=on
 autopairs=on
 
+# Session / safety
+session=on
+recovery=on
+recovery_interval=30
+backup=on
+
 # Optional: extra syntax definitions or overrides.
 # ~ is expanded by TEDIT for this setting.
 # syntaxdir=~/.tedit/syntax
