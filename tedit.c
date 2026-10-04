@@ -312,6 +312,8 @@ static int prompt_input(const char *prompt, char *out, int outlen);
 static void path_parent(char *path);
 static int file_browser(char *out, int outlen);
 static int load_file(const char *name);
+static int path_exists(const char *path);
+static int create_new_buffer(void);
 
 static void set_status(const char *s)
 {
