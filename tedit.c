@@ -169,6 +169,7 @@ enum {
     ACT_FIND_FILES,
     ACT_NEXT_RESULT,
     ACT_TOGGLE_OUTPUT,
+    ACT_OUTPUT_BROWSER,
     ACT_SPLIT_TOGGLE,
     ACT_SPLIT_SWITCH,
     ACT_SYMBOLS_TOGGLE,
@@ -335,6 +336,7 @@ static const MenuItem project_menu[] = {
     {"Run", ACT_RUN},
     {"Find in files...", ACT_FIND_FILES},
     {"Next result/error", ACT_NEXT_RESULT},
+    {"Browse output/results...", ACT_OUTPUT_BROWSER},
     {"Toggle output pane", ACT_TOGGLE_OUTPUT}
 };
 
@@ -394,6 +396,7 @@ static void free_capture(UndoCapture *cap);
 static void clear_stack(EditOp *stack, int *count);
 static int confirm_yes_no(const char *message);
 static void compute_bracket_match(void);
+static int jump_to_output_location(void);
 
 static void set_status(const char *s)
 {
@@ -1442,6 +1445,95 @@ static int find_in_tree(const char *dir, const char *needle, int depth)
 
     closedir(dp);
     return output_count;
+}
+
+static void output_browser_dialog(void)
+{
+    int selected;
+    int top;
+    int ch;
+
+    if (output_count <= 0) {
+        set_status("No output to browse");
+        return;
+    }
+
+    selected = output_cursor;
+    if (selected < 0 || selected >= output_count)
+        selected = 0;
+    top = 0;
+
+    for (;;) {
+        int visible;
+        int i;
+
+        visible = LINES - 4;
+        if (visible < 1)
+            visible = 1;
+
+        if (selected < top)
+            top = selected;
+        if (selected >= top + visible)
+            top = selected - visible + 1;
+
+        erase();
+        attron(A_REVERSE);
+        mvaddstr(0, 0, " TEDIT Output / Results ");
+        clrtoeol();
+        attroff(A_REVERSE);
+
+        for (i = 0; i < visible; i++) {
+            int oi;
+
+            oi = top + i;
+            if (oi >= output_count)
+                break;
+
+            if (oi == selected)
+                attron(A_REVERSE);
+
+            mvaddnstr(i + 2, 1, output_lines[oi], COLS - 2);
+
+            if (oi == selected)
+                attroff(A_REVERSE);
+        }
+
+        mvaddstr(LINES - 1, 0,
+                 "Enter jump to file:line  Up/Down move  Esc close");
+        refresh();
+
+        ch = getch();
+
+        if (ch == 27)
+            return;
+
+        if (ch == KEY_UP && selected > 0)
+            selected--;
+        else if (ch == KEY_DOWN && selected + 1 < output_count)
+            selected++;
+#ifdef KEY_PPAGE
+        else if (ch == KEY_PPAGE) {
+            selected -= visible;
+            if (selected < 0)
+                selected = 0;
+        }
+#endif
+#ifdef KEY_NPAGE
+        else if (ch == KEY_NPAGE) {
+            selected += visible;
+            if (selected >= output_count)
+                selected = output_count - 1;
+        }
+#endif
+        else if (ch == '\n' || ch == '\r') {
+            output_cursor = selected;
+
+            if (jump_to_output_location())
+                return;
+
+            set_status("Selected line has no file:line target");
+        }
+    }
 }
 
 static void do_find_in_files(void)
@@ -5473,7 +5565,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 8");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 9");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -5644,6 +5736,7 @@ static void execute_action(int action)
         output_visible = !output_visible;
         set_status(output_visible ? "Output pane shown" : "Output pane hidden");
         break;
+    case ACT_OUTPUT_BROWSER: output_browser_dialog(); break;
     case ACT_SPLIT_TOGGLE: toggle_split(); break;
     case ACT_SPLIT_SWITCH: switch_split_pane(); break;
     case ACT_SYMBOLS_TOGGLE:
@@ -5900,7 +5993,7 @@ static int shortcut_action(int ch)
     return ACT_NONE;
 }
 
-static void activate_menu(void)
+static void activate_menu_from(int initial_menu)
 {
     int menu_index;
     int item_index;
@@ -5908,7 +6001,9 @@ static void activate_menu(void)
     int count;
     const MenuItem *items;
 
-    menu_index = 0;
+    menu_index = initial_menu;
+    if (menu_index < 0 || menu_index >= MENU_COUNT)
+        menu_index = 0;
     items = get_menu(menu_index, &count);
     item_index = first_selectable(items, count);
 
@@ -5973,6 +6068,12 @@ static void activate_menu(void)
     draw_screen();
 }
 
+
+static void activate_menu(void)
+{
+    activate_menu_from(0);
+}
+
 static void process_key(int ch)
 {
     int len;
@@ -6013,23 +6114,125 @@ static void process_key(int ch)
             rows = editor_active_text_rows();
             sidebar = symbol_sidebar_width();
 
-            if (ev.y >= 1 && ev.y <= rows &&
-                ev.x >= gutter && ev.x < COLS - sidebar) {
-                int nr;
-                int nc;
+#ifdef BUTTON4_PRESSED
+            if (ev.bstate & BUTTON4_PRESSED) {
+                cy -= 3;
+                if (cy < 0)
+                    cy = 0;
+                if (cx > (int)strlen(lines[cy]))
+                    cx = (int)strlen(lines[cy]);
+                scroll_screen();
+                return;
+            }
+#endif
 
-                nr = rowoff + ev.y - 1;
-                nc = coloff + ev.x - gutter;
+#ifdef BUTTON5_PRESSED
+            if (ev.bstate & BUTTON5_PRESSED) {
+                cy += 3;
+                if (cy >= nlines)
+                    cy = nlines - 1;
+                if (cx > (int)strlen(lines[cy]))
+                    cx = (int)strlen(lines[cy]);
+                scroll_screen();
+                return;
+            }
+#endif
 
-                if (nr >= 0 && nr < nlines) {
-                    cy = nr;
-                    if (nc < 0) nc = 0;
-                    if (nc > (int)strlen(lines[cy]))
-                        nc = (int)strlen(lines[cy]);
-                    cx = nc;
-                    scroll_screen();
+#ifdef BUTTON1_CLICKED
+            if (ev.bstate & BUTTON1_CLICKED) {
+                if (ev.y == 0) {
+                    int mx;
+                    int mi;
+                    int bx;
+
+                    mx = 1;
+
+                    for (mi = 0; mi < MENU_COUNT; mi++) {
+                        int width;
+
+                        width = (int)strlen(menu_names[mi]) + 2;
+
+                        if (ev.x >= mx && ev.x < mx + width) {
+                            activate_menu_from(mi);
+                            return;
+                        }
+
+                        mx += width;
+                    }
+
+                    bx = 51;
+
+                    for (mi = 0; mi < buffer_count; mi++) {
+                        const char *bn;
+                        const char *slash;
+                        char tab[64];
+                        int width;
+
+                        bn = buffers[mi].fname[0] ?
+                             buffers[mi].fname : "[No Name]";
+                        slash = strrchr(bn, '/');
+                        if (slash != NULL)
+                            bn = slash + 1;
+
+                        sprintf(tab, "%c%d:%.*s%s%c",
+                                mi == curbuf ? '[' : ' ',
+                                mi + 1, 18, bn,
+                                buffers[mi].dirty ? "*" : "",
+                                mi == curbuf ? ']' : ' ');
+
+                        width = (int)strlen(tab);
+
+                        if (ev.x >= bx && ev.x < bx + width) {
+                            if (mi != curbuf) {
+                                curbuf = mi;
+                                reset_edit_history();
+                                selecting = 0;
+                            }
+                            return;
+                        }
+
+                        bx += width + 1;
+                    }
+                }
+
+                if (sidebar > 0 && ev.x >= COLS - sidebar &&
+                    ev.y >= 2 && ev.y < 1 + editor_total_text_rows()) {
+                    int symbol_rows[128];
+                    char names[128][80];
+                    int count;
+                    int si;
+
+                    count = collect_symbols(symbol_rows, names, 128);
+                    si = ev.y - 2;
+
+                    if (si >= 0 && si < count) {
+                        cy = symbol_rows[si];
+                        cx = 0;
+                        scroll_screen();
+                        return;
+                    }
+                }
+
+                if (ev.y >= 1 && ev.y <= rows &&
+                    ev.x >= gutter && ev.x < COLS - sidebar) {
+                    int nr;
+                    int nc;
+
+                    nr = rowoff + ev.y - 1;
+                    nc = coloff + ev.x - gutter;
+
+                    if (nr >= 0 && nr < nlines) {
+                        cy = nr;
+                        if (nc < 0)
+                            nc = 0;
+                        if (nc > (int)strlen(lines[cy]))
+                            nc = (int)strlen(lines[cy]);
+                        cx = nc;
+                        scroll_screen();
+                    }
                 }
             }
+#endif
         }
 
         return;
