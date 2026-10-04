@@ -202,6 +202,7 @@ typedef struct {
     int dirty;
     int eol_mode;
     int encoding;
+    int final_newline;
     char fname[NAME_LEN];
 } Buffer;
 
@@ -219,6 +220,7 @@ static unsigned char bookmarks[MAX_BUFFERS][MAX_LINES];
 #define modified (buffers[curbuf].dirty)
 #define eol_mode (buffers[curbuf].eol_mode)
 #define encoding (buffers[curbuf].encoding)
+#define final_newline (buffers[curbuf].final_newline)
 #define filename (buffers[curbuf].fname)
 
 static int tab_width = 4;
@@ -1730,6 +1732,7 @@ static void init_buffer(void)
     modified = 0;
     eol_mode = EOL_LF;
     encoding = ENC_ASCII;
+    final_newline = 0;
     filename[0] = '\0';
     memset(bookmarks[curbuf], 0, MAX_LINES);
 }
@@ -2350,16 +2353,20 @@ static int utf8_valid_bytes(const unsigned char *s)
         if (c < 0x80) {
             i++;
         } else if ((c & 0xe0) == 0xc0) {
-            if ((s[i + 1] & 0xc0) != 0x80 || c < 0xc2)
+            if (s[i + 1] == '\0' ||
+                (s[i + 1] & 0xc0) != 0x80 || c < 0xc2)
                 return 0;
             i += 2;
         } else if ((c & 0xf0) == 0xe0) {
-            if ((s[i + 1] & 0xc0) != 0x80 ||
+            if (s[i + 1] == '\0' || s[i + 2] == '\0' ||
+                (s[i + 1] & 0xc0) != 0x80 ||
                 (s[i + 2] & 0xc0) != 0x80)
                 return 0;
             i += 3;
         } else if ((c & 0xf8) == 0xf0) {
-            if ((s[i + 1] & 0xc0) != 0x80 ||
+            if (s[i + 1] == '\0' || s[i + 2] == '\0' ||
+                s[i + 3] == '\0' ||
+                (s[i + 1] & 0xc0) != 0x80 ||
                 (s[i + 2] & 0xc0) != 0x80 ||
                 (s[i + 3] & 0xc0) != 0x80 ||
                 c > 0xf4)
@@ -2412,6 +2419,7 @@ static int load_file(const char *name)
     int pos;
     int ch;
     int detected_eol;
+    int last_was_eol;
 
     fp = fopen(name, "rb");
 
@@ -2427,6 +2435,7 @@ static int load_file(const char *name)
         modified = 0;
         eol_mode = EOL_LF;
         encoding = ENC_ASCII;
+        final_newline = 0;
         cy = cx = rowoff = coloff = 0;
         selecting = 0;
         column_selecting = 0;
@@ -2440,6 +2449,7 @@ static int load_file(const char *name)
     nlines = 0;
     pos = 0;
     detected_eol = -1;
+    last_was_eol = 0;
 
     while ((ch = fgetc(fp)) != EOF && nlines < MAX_LINES) {
         if (ch == '\r' || ch == '\n') {
@@ -2475,8 +2485,10 @@ static int load_file(const char *name)
 
             nlines++;
             pos = 0;
+            last_was_eol = 1;
         } else if (pos < MAX_LINE - 1) {
             buf[pos++] = (char)ch;
+            last_was_eol = 0;
         }
     }
 
@@ -2500,6 +2512,7 @@ static int load_file(const char *name)
 
     modified = 0;
     eol_mode = detected_eol >= 0 ? detected_eol : EOL_LF;
+    final_newline = last_was_eol;
     detect_buffer_encoding();
 
     cy = cx = rowoff = coloff = 0;
@@ -2527,7 +2540,7 @@ static int save_file_as(const char *name)
     for (i = 0; i < nlines; i++) {
         fputs(lines[i], fp);
 
-        if (i < nlines - 1) {
+        if (i < nlines - 1 || final_newline) {
             if (eol_mode == EOL_CRLF)
                 fputs("\r\n", fp);
             else if (eol_mode == EOL_CR)
