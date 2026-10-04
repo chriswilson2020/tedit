@@ -13,7 +13,7 @@ static int def_count = 0;
 
 static void trim(char *s)
 {
-    const char *p;
+    char *p;
     int len;
 
     while (*s && isspace((unsigned char)*s))
@@ -409,7 +409,7 @@ void syntax_highlight_line(const SyntaxDef *def, const char *line,
         start = i;
 
         if (state->in_block_comment && def->block_end[0] != '\0') {
-            char *p;
+            const char *p;
             p = strstr(line + i, def->block_end);
             if (p == NULL) {
                 emit_span(callback, i, len, SYNTAX_STYLE_COMMENT, user);
@@ -431,7 +431,7 @@ void syntax_highlight_line(const SyntaxDef *def, const char *line,
         if (def->block_start[0] != '\0' &&
             !strncmp(line + i, def->block_start,
                      strlen(def->block_start))) {
-            char *p;
+            const char *p;
             int after;
             after = i + (int)strlen(def->block_start);
             p = strstr(line + after, def->block_end);
