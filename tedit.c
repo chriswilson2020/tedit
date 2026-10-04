@@ -139,6 +139,12 @@ enum {
     ACT_FIND_FILES,
     ACT_NEXT_RESULT,
     ACT_TOGGLE_OUTPUT,
+    ACT_SPLIT_TOGGLE,
+    ACT_SPLIT_SWITCH,
+    ACT_SYMBOLS_TOGGLE,
+    ACT_SYMBOL_LIST,
+    ACT_NEXT_SYMBOL,
+    ACT_PREV_SYMBOL,
     ACT_OPEN_RECENT,
     ACT_RECOVER,
     ACT_FIND,
@@ -202,6 +208,10 @@ static char output_lines[OUTPUT_MAX][OUTPUT_LINE];
 static int output_count = 0;
 static int output_visible = 0;
 static int output_cursor = 0;
+
+static int split_enabled = 0;
+static int split_other = -1;
+static int symbol_sidebar_enabled = 0;
 
 static int session_enabled = 1;
 static int recovery_enabled = 1;
@@ -281,6 +291,16 @@ static const MenuItem project_menu[] = {
     {"Toggle output pane", ACT_TOGGLE_OUTPUT}
 };
 
+static const MenuItem view_menu[] = {
+    {"Toggle split", ACT_SPLIT_TOGGLE},
+    {"Switch split pane", ACT_SPLIT_SWITCH},
+    {"Toggle symbols", ACT_SYMBOLS_TOGGLE},
+    {"Symbol list...", ACT_SYMBOL_LIST},
+    {"Next symbol", ACT_NEXT_SYMBOL},
+    {"Previous symbol", ACT_PREV_SYMBOL},
+    {"Toggle output pane", ACT_TOGGLE_OUTPUT}
+};
+
 static const MenuItem options_menu[] = {
     {"Toggle syntax", ACT_TOGGLE_SYNTAX},
     {"Toggle line numbers", ACT_TOGGLE_LINES},
@@ -296,10 +316,10 @@ static const MenuItem help_menu[] = {
 };
 
 static const char *menu_names[] = {
-    "File", "Edit", "Search", "Project", "Options", "Help"
+    "File", "Edit", "Search", "Project", "View", "Options", "Help"
 };
 
-#define MENU_COUNT 6
+#define MENU_COUNT 7
 
 
 static char *dupstr(const char *s)
@@ -789,6 +809,321 @@ static int output_pane_height(void)
     return h > 0 ? h : 0;
 }
 
+
+static int editor_total_text_rows(void)
+{
+    int rows;
+
+    rows = LINES - 3 - output_pane_height();
+    if (rows < 1)
+        rows = 1;
+
+    return rows;
+}
+
+static int editor_active_text_rows(void)
+{
+    int rows;
+
+    rows = editor_total_text_rows();
+
+    if (split_enabled && buffer_count > 1) {
+        rows = (rows - 1) / 2;
+        if (rows < 1)
+            rows = 1;
+    }
+
+    return rows;
+}
+
+static int symbol_sidebar_width(void)
+{
+    if (!symbol_sidebar_enabled || COLS < 72)
+        return 0;
+    return 30;
+}
+
+static int editor_text_columns(int gutter)
+{
+    int cols;
+
+    cols = COLS - gutter - 1 - symbol_sidebar_width();
+    if (cols < 1)
+        cols = 1;
+
+    return cols;
+}
+
+static int line_looks_like_symbol(const char *line)
+{
+    const char *p;
+    char word[32];
+    int wi;
+
+    p = line;
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    if (*p == '\0' || *p == '#' || *p == ';')
+        return 0;
+
+    wi = 0;
+    while (*p && wi < (int)sizeof(word) - 1 &&
+          (isalnum((unsigned char)*p) || *p == '_')) {
+        word[wi++] = (char)tolower((unsigned char)*p);
+        p++;
+    }
+    word[wi] = '\0';
+
+    if (!strcmp(word, "def") || !strcmp(word, "class") ||
+        !strcmp(word, "fn") || !strcmp(word, "func") ||
+        !strcmp(word, "function") || !strcmp(word, "subroutine") ||
+        !strcmp(word, "program") || !strcmp(word, "module") ||
+        !strcmp(word, "procedure") || !strcmp(word, "package") ||
+        !strcmp(word, "interface") || !strcmp(word, "struct") ||
+        !strcmp(word, "enum") || !strcmp(word, "type"))
+        return 1;
+
+    /*
+     * Conservative C/C++ style function heuristic: a line containing a
+     * parameter list, but not an ordinary control statement.
+     */
+    if (strchr(line, '(') != NULL && strchr(line, ')') != NULL) {
+        if (strcmp(word, "if") && strcmp(word, "for") &&
+            strcmp(word, "while") && strcmp(word, "switch") &&
+            strcmp(word, "return") && strcmp(word, "sizeof"))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int collect_symbols(int *rows, char names[][80], int max_symbols)
+{
+    int row;
+    int count;
+
+    count = 0;
+
+    for (row = 0; row < nlines && count < max_symbols; row++) {
+        const char *p;
+
+        if (!line_looks_like_symbol(lines[row]))
+            continue;
+
+        p = lines[row];
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        rows[count] = row;
+        strncpy(names[count], p, 79);
+        names[count][79] = '\0';
+        count++;
+    }
+
+    return count;
+}
+
+static void draw_symbol_sidebar(int start_y, int rows)
+{
+    int symbol_rows[128];
+    char names[128][80];
+    int count;
+    int i;
+    int width;
+    int x;
+
+    width = symbol_sidebar_width();
+    if (width <= 0 || rows <= 0)
+        return;
+
+    x = COLS - width;
+    count = collect_symbols(symbol_rows, names, 128);
+
+    attron(A_REVERSE);
+    mvaddstr(start_y, x, " Symbols ");
+    {
+        int k;
+        for (k = 9; k < width; k++)
+            addch(' ');
+    }
+    attroff(A_REVERSE);
+
+    for (i = 1; i < rows; i++) {
+        int si;
+        char linebuf[96];
+
+        move(start_y + i, x);
+        {
+            int k;
+            for (k = 0; k < width; k++)
+                addch(' ');
+        }
+
+        si = i - 1;
+        if (si >= count)
+            continue;
+
+        sprintf(linebuf, "%4d %.22s", symbol_rows[si] + 1, names[si]);
+        mvaddnstr(start_y + i, x, linebuf, width - 1);
+    }
+}
+
+static void symbol_list_dialog(void)
+{
+    int symbol_rows[128];
+    char names[128][80];
+    int count;
+    int selected;
+    int top;
+    int ch;
+
+    count = collect_symbols(symbol_rows, names, 128);
+    if (count <= 0) {
+        set_status("No symbols found");
+        return;
+    }
+
+    selected = 0;
+    top = 0;
+
+    for (;;) {
+        int visible;
+        int i;
+
+        visible = LINES - 4;
+        if (visible < 1)
+            visible = 1;
+
+        if (selected < top)
+            top = selected;
+        if (selected >= top + visible)
+            top = selected - visible + 1;
+
+        erase();
+        attron(A_REVERSE);
+        mvaddstr(0, 0, " TEDIT Symbols ");
+        clrtoeol();
+        attroff(A_REVERSE);
+
+        for (i = 0; i < visible; i++) {
+            int si;
+            char rowbuf[96];
+
+            si = top + i;
+            if (si >= count)
+                break;
+
+            sprintf(rowbuf, "%5d  %s", symbol_rows[si] + 1, names[si]);
+
+            if (si == selected)
+                attron(A_REVERSE);
+            mvaddnstr(i + 2, 2, rowbuf, COLS - 4);
+            if (si == selected)
+                attroff(A_REVERSE);
+        }
+
+        mvaddstr(LINES - 1, 0, "Enter jump  Up/Down move  Esc cancel");
+        refresh();
+        ch = getch();
+
+        if (ch == 27)
+            return;
+        if (ch == KEY_UP && selected > 0)
+            selected--;
+        else if (ch == KEY_DOWN && selected + 1 < count)
+            selected++;
+        else if (ch == '\n' || ch == '\r') {
+            cy = symbol_rows[selected];
+            cx = 0;
+            scroll_screen();
+            set_status("Jumped to symbol");
+            return;
+        }
+    }
+}
+
+static void jump_symbol(int dir)
+{
+    int symbol_rows[128];
+    char names[128][80];
+    int count;
+    int i;
+
+    count = collect_symbols(symbol_rows, names, 128);
+    if (count <= 0) {
+        set_status("No symbols found");
+        return;
+    }
+
+    if (dir > 0) {
+        for (i = 0; i < count; i++) {
+            if (symbol_rows[i] > cy) {
+                cy = symbol_rows[i];
+                cx = 0;
+                scroll_screen();
+                set_status("Next symbol");
+                return;
+            }
+        }
+        cy = symbol_rows[0];
+    } else {
+        for (i = count - 1; i >= 0; i--) {
+            if (symbol_rows[i] < cy) {
+                cy = symbol_rows[i];
+                cx = 0;
+                scroll_screen();
+                set_status("Previous symbol");
+                return;
+            }
+        }
+        cy = symbol_rows[count - 1];
+    }
+
+    cx = 0;
+    scroll_screen();
+    set_status(dir > 0 ? "Next symbol" : "Previous symbol");
+}
+
+static void toggle_split(void)
+{
+    if (buffer_count < 2) {
+        set_status("Open at least two buffers to split");
+        return;
+    }
+
+    split_enabled = !split_enabled;
+
+    if (split_enabled) {
+        split_other = (curbuf + 1) % buffer_count;
+        set_status("Split view enabled");
+    } else {
+        split_other = -1;
+        set_status("Split view disabled");
+    }
+
+    scroll_screen();
+}
+
+static void switch_split_pane(void)
+{
+    int tmp;
+
+    if (!split_enabled || split_other < 0 ||
+        split_other >= buffer_count || split_other == curbuf) {
+        set_status("Split view is not active");
+        return;
+    }
+
+    tmp = curbuf;
+    curbuf = split_other;
+    split_other = tmp;
+    reset_edit_history();
+    selecting = 0;
+    scroll_screen();
+    set_status("Switched split pane");
+}
+
 static void output_clear(void)
 {
     output_count = 0;
@@ -1257,6 +1592,9 @@ static void switch_buffer(int dir)
 static void close_current_buffer(void)
 {
     int i;
+
+    split_enabled = 0;
+    split_other = -1;
 
     if (modified) {
         char msg[STATUS_LEN];
@@ -2936,7 +3274,7 @@ static void draw_plain_line(int y, int row, const char *s, int gutter)
 
     len = (int)strlen(s);
     start = coloff;
-    end = coloff + (COLS - gutter - 1);
+    end = coloff + editor_text_columns(gutter);
 
     if (start > len)
         return;
@@ -3062,7 +3400,7 @@ static void ansi_overlay_syntax(void)
         return;
 
     gutter = line_numbers ? 6 : 0;
-    textrows = LINES - 3;
+    textrows = editor_active_text_rows();
     if (textrows < 1)
         textrows = 1;
 
@@ -3083,7 +3421,7 @@ static void ansi_overlay_syntax(void)
         ctx.row = filerow;
         ctx.gutter = gutter;
         ctx.visible_start = coloff;
-        ctx.visible_end = coloff + (COLS - gutter - 1);
+        ctx.visible_end = coloff + editor_text_columns(gutter);
         ctx.line = lines[filerow];
 
         syntax_highlight_line(def, lines[filerow], &state,
@@ -3117,12 +3455,12 @@ static void draw_screen(void)
     else
         attron(A_REVERSE);
 
-    mvaddstr(0, 0, " File  Edit  Search  Project  Options  Help ");
+    mvaddstr(0, 0, " File  Edit  Search  Project  View  Options  Help ");
     {
         int bx;
         int bi;
 
-        bx = 45;
+        bx = 51;
 
         for (bi = 0; bi < buffer_count && bx < COLS - 4; bi++) {
             const char *bn;
@@ -3156,7 +3494,7 @@ static void draw_screen(void)
         attroff(A_REVERSE);
 
     gutter = line_numbers ? 6 : 0;
-    textrows = LINES - 3;
+    textrows = editor_active_text_rows();
     if (textrows < 1)
         textrows = 1;
 
@@ -3185,6 +3523,64 @@ static void draw_screen(void)
 
         draw_plain_line(y + 1, filerow, lines[filerow], gutter);
     }
+
+
+    if (split_enabled && split_other >= 0 &&
+        split_other < buffer_count && split_other != curbuf) {
+        int separator_y;
+        int bottom_y;
+        int bottom_rows;
+        int saved_buf;
+        int saved_selecting;
+
+        separator_y = textrows + 1;
+        bottom_y = separator_y + 1;
+        bottom_rows = editor_total_text_rows() - textrows - 1;
+
+        attron(A_REVERSE);
+        move(separator_y, 0);
+        clrtoeol();
+        mvprintw(separator_y, 1, " Other buffer: %s ",
+                 buffers[split_other].fname[0] ?
+                 buffers[split_other].fname : "[No Name]");
+        attroff(A_REVERSE);
+
+        saved_buf = curbuf;
+        saved_selecting = selecting;
+        curbuf = split_other;
+        selecting = 0;
+
+        for (y = 0; y < bottom_rows; y++) {
+            filerow = rowoff + y;
+
+            if (line_numbers) {
+                if (use_color)
+                    attron(COLOR_PAIR(CP_LINENO));
+                else
+                    attron(A_BOLD);
+
+                if (filerow < nlines)
+                    mvprintw(bottom_y + y, 0, "%5d ", filerow + 1);
+                else
+                    mvaddstr(bottom_y + y, 0, "    ~ ");
+
+                if (use_color)
+                    attroff(COLOR_PAIR(CP_LINENO));
+                else
+                    attroff(A_BOLD);
+            }
+
+            if (filerow < nlines)
+                draw_plain_line(bottom_y + y, filerow,
+                                lines[filerow], gutter);
+        }
+
+        curbuf = saved_buf;
+        selecting = saved_selecting;
+    }
+
+    if (symbol_sidebar_width() > 0)
+        draw_symbol_sidebar(1, editor_total_text_rows());
 
     if (use_color)
         attron(COLOR_PAIR(CP_STATUS));
@@ -4341,7 +4737,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 4");
+    mvaddstr(2, 4, "TEDIT v7.0-dev stage 5");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
@@ -4495,6 +4891,16 @@ static void execute_action(int action)
         output_visible = !output_visible;
         set_status(output_visible ? "Output pane shown" : "Output pane hidden");
         break;
+    case ACT_SPLIT_TOGGLE: toggle_split(); break;
+    case ACT_SPLIT_SWITCH: switch_split_pane(); break;
+    case ACT_SYMBOLS_TOGGLE:
+        symbol_sidebar_enabled = !symbol_sidebar_enabled;
+        set_status(symbol_sidebar_enabled ? "Symbol sidebar shown" :
+                                              "Symbol sidebar hidden");
+        break;
+    case ACT_SYMBOL_LIST: symbol_list_dialog(); break;
+    case ACT_NEXT_SYMBOL: jump_symbol(1); break;
+    case ACT_PREV_SYMBOL: jump_symbol(-1); break;
     case ACT_OPEN_RECENT: do_open_recent(); break;
     case ACT_RECOVER: do_recover(); break;
     case ACT_FIND: do_find(); break;
@@ -4541,9 +4947,12 @@ static const MenuItem *get_menu(int menu_index, int *count)
         *count = sizeof(project_menu) / sizeof(project_menu[0]);
         return project_menu;
     case 4:
+        *count = sizeof(view_menu) / sizeof(view_menu[0]);
+        return view_menu;
+    case 5:
         *count = sizeof(options_menu) / sizeof(options_menu[0]);
         return options_menu;
-    case 5:
+    case 6:
         *count = sizeof(help_menu) / sizeof(help_menu[0]);
         return help_menu;
     }
@@ -4832,6 +5241,42 @@ static void process_key(int ch)
         return;
     }
 
+#if defined(KEY_MOUSE) && defined(ALL_MOUSE_EVENTS)
+    if (ch == KEY_MOUSE) {
+        MEVENT ev;
+
+        if (getmouse(&ev) == OK) {
+            int gutter;
+            int rows;
+            int sidebar;
+
+            gutter = line_numbers ? 6 : 0;
+            rows = editor_active_text_rows();
+            sidebar = symbol_sidebar_width();
+
+            if (ev.y >= 1 && ev.y <= rows &&
+                ev.x >= gutter && ev.x < COLS - sidebar) {
+                int nr;
+                int nc;
+
+                nr = rowoff + ev.y - 1;
+                nc = coloff + ev.x - gutter;
+
+                if (nr >= 0 && nr < nlines) {
+                    cy = nr;
+                    if (nc < 0) nc = 0;
+                    if (nc > (int)strlen(lines[cy]))
+                        nc = (int)strlen(lines[cy]);
+                    cx = nc;
+                    scroll_screen();
+                }
+            }
+        }
+
+        return;
+    }
+#endif
+
     switch (ch) {
     case CTRL_KEY('q'):
         quit_editor();
@@ -5082,6 +5527,10 @@ int main(int argc, char **argv)
     raw();
     noecho();
     keypad(stdscr, TRUE);
+
+#if defined(KEY_MOUSE) && defined(ALL_MOUSE_EVENTS)
+    mousemask(ALL_MOUSE_EVENTS, NULL);
+#endif
 
     init_colors_if_possible();
 
