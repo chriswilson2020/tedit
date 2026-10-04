@@ -36,6 +36,8 @@ install: tedit
 	chmod 644 $(DESTDIR)$(SYNTAXDIR)/*.conf
 	cp teditrc.example $(DESTDIR)$(DATADIR)/teditrc.example
 	chmod 644 $(DESTDIR)$(DATADIR)/teditrc.example
+	cp tedit-project.example $(DESTDIR)$(DATADIR)/tedit-project.example
+	chmod 644 $(DESTDIR)$(DATADIR)/tedit-project.example
 
 install-user: tedit
 	$(MAKE) install PREFIX=$(HOME)/.local
@@ -44,6 +46,7 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/tedit
 	@for f in $(SYNTAX_FILES); do rm -f $(DESTDIR)$(SYNTAXDIR)/$$f; done
 	rm -f $(DESTDIR)$(DATADIR)/teditrc.example
+	rm -f $(DESTDIR)$(DATADIR)/tedit-project.example
 	-rmdir $(DESTDIR)$(SYNTAXDIR) 2>/dev/null
 	-rmdir $(DESTDIR)$(DATADIR) 2>/dev/null
 
