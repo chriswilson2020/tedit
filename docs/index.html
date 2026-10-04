@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="TEDIT — a small, portable, menu-driven programmer's editor for classic UNIX and modern Unix-like systems.">
+  <meta name="theme-color" content="#111315">
+  <title>TEDIT 7.0 — Portable UNIX Programmer's Editor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="#top" aria-label="TEDIT home"><span class="prompt">:</span>TEDIT</a>
+    <nav aria-label="Primary">
+      <a href="#features">Features</a>
+      <a href="#build">Build</a>
+      <a href="#platforms">Platforms</a>
+      <a href="https://github.com/chriswilson2020/tedit">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">PORTABLE C89 · CURSES · UNIX</p>
+        <h1>A programmer's editor for machines old and new.</h1>
+        <p class="lede">TEDIT is a small, conventional, menu-driven text and code editor built in portable C and plain curses. It sits between nano/JOE/mcedit and a full IDE — without dragging in a modern runtime.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/chriswilson2020/tedit">View on GitHub</a>
+          <a class="button" href="https://github.com/chriswilson2020/tedit/archive/refs/heads/main.tar.gz">Download source</a>
+        </div>
+        <div class="facts" aria-label="Project facts">
+          <span><strong>7.0</strong> current</span>
+          <span><strong>C89</strong> CI target</span>
+          <span><strong>~126 KiB</strong> stripped x86-64</span>
+        </div>
+      </div>
+
+      <div class="terminal-shell" aria-label="Stylised TEDIT editor preview">
+        <div class="terminal-titlebar">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="terminal-title">tedit — hello.c</span>
+        </div>
+        <div class="editor">
+          <div class="menu">File&nbsp;&nbsp; Edit&nbsp;&nbsp; Search&nbsp;&nbsp; Project&nbsp;&nbsp; View&nbsp;&nbsp; Options&nbsp;&nbsp; Help</div>
+          <div class="tabs"><span class="tab active">hello.c</span><span class="tab">notes.txt</span></div>
+          <pre><span class="ln">1</span> <span class="pp">#include</span> &lt;stdio.h&gt;
+<span class="ln">2</span>
+<span class="ln">3</span> <span class="kw">int</span> main(<span class="kw">void</span>)
+<span class="ln">4</span> {
+<span class="ln">5</span>     printf(<span class="str">"Hello from TEDIT!\n"</span>);
+<span class="ln">6</span>     <span class="kw">return</span> <span class="num">0</span>;
+<span class="ln">7</span> }
+<span class="ln">8</span></pre>
+          <div class="status">C &nbsp; UTF-8 &nbsp; LF &nbsp; Ln 5, Col 12 &nbsp; [Project: standalone]</div>
+          <div class="output"><span>$ cc -o hello hello.c</span><br><span class="ok">[Build finished: status 0]</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="strip">
+      <p>Designed for <strong>IRIX</strong>, Linux, BSD and other Unix-like systems.</p>
+      <p>No Electron. No plugin runtime. No dependency avalanche.</p>
+    </section>
+
+    <section id="features" class="section">
+      <div class="section-head">
+        <p class="eyebrow">FEATURES</p>
+        <h2>Small editor. Proper tools.</h2>
+        <p>TEDIT keeps the interaction model familiar while adding the features you actually want when writing code on a terminal.</p>
+      </div>
+
+      <div class="grid cards">
+        <article class="card">
+          <h3>Editing</h3>
+          <p>Multiple buffers, split view, undo/redo, rectangular selection, block indent, comments, line operations, bracket matching and bookmarks.</p>
+        </article>
+        <article class="card">
+          <h3>Syntax</h3>
+          <p>Config-driven highlighting for C/C++, Python, shell, Make, Perl, Fortran, Ada, JSON, Rust, Go, JavaScript and TypeScript.</p>
+        </article>
+        <article class="card">
+          <h3>Projects</h3>
+          <p>Project-root detection, file browser, find-in-files, Build/Clean/Run, captured compiler output and source-location navigation.</p>
+        </article>
+        <article class="card">
+          <h3>Navigator</h3>
+          <p>Two-pane Midnight Commander-style file navigation with copy, move, delete, rename, mkdir, sorting and directory bookmarks.</p>
+        </article>
+        <article class="card">
+          <h3>Recovery</h3>
+          <p>Sessions, recent files, timed recovery snapshots and optional traditional <code>file~</code> backups.</p>
+        </article>
+        <article class="card">
+          <h3>Portable by design</h3>
+          <p>Plain C, curses and standard Unix interfaces. Keyboard-first operation stays available even on older curses implementations.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="build" class="section split-section">
+      <div>
+        <p class="eyebrow">BUILD &amp; RUN</p>
+        <h2>One make away.</h2>
+        <p>Clone it, build it, run it. TEDIT's own project configuration makes its in-editor Build command run <code>make</code> and Run launch <code>./tedit</code>.</p>
+        <div class="code-block"><span>$ git clone https://github.com/chriswilson2020/tedit.git</span>
+<span>$ cd tedit</span>
+<span>$ make</span>
+<span>$ ./tedit</span></div>
+      </div>
+      <div class="callout">
+        <h3>Smart standalone builds</h3>
+        <p>Open a lone C source file with no Makefile and TEDIT knows what to do.</p>
+        <div class="code-block compact"><span>hello.c</span>
+<span class="muted">Project → Build</span>
+<span>$ cc -o hello hello.c</span>
+<span class="muted">Project → Run</span>
+<span>$ ./hello</span></div>
+        <p class="small">For Makefile projects, Build runs <code>make</code>. Add a <code>run=...</code> entry to <code>.tedit-project</code> when the executable cannot be inferred safely.</p>
+      </div>
+    </section>
+
+    <section id="platforms" class="section">
+      <div class="section-head">
+        <p class="eyebrow">PLATFORMS</p>
+        <h2>Classic UNIX is a first-class target.</h2>
+      </div>
+      <div class="platform-grid">
+        <div class="platform"><span class="badge">SGI</span><h3>IRIX 6.5</h3><p>Explicitly supported, including old curses behaviour and ANSI colour fallback.</p></div>
+        <div class="platform"><span class="badge">ARM</span><h3>Raspberry Pi</h3><p>Builds natively with GCC and ncurses. Tiny enough for a Pi Zero-class machine.</p></div>
+        <div class="platform"><span class="badge">x86</span><h3>Linux</h3><p>Strict C89 CI builds on Ubuntu. Current stripped x86-64 binary is about 126 KiB.</p></div>
+        <div class="platform"><span class="badge">BSD</span><h3>BSD / Unix</h3><p>The code avoids modern runtime dependencies and sticks to conventional Unix interfaces.</p></div>
+      </div>
+    </section>
+
+    <section class="section philosophy">
+      <p class="eyebrow">THE IDEA</p>
+      <blockquote>Modern enough to be useful. Old-fashioned enough to run where you actually want it.</blockquote>
+      <p>TEDIT is intentionally not an IDE disguised as a terminal editor. It gives you menus, project tools, syntax highlighting, navigation, recovery and multiple buffers — while remaining a small C program you can build on a decades-old workstation.</p>
+    </section>
+
+    <section class="cta">
+      <div>
+        <p class="eyebrow">GET TEDIT</p>
+        <h2>Build it on your machine.</h2>
+      </div>
+      <div class="actions">
+        <a class="button primary" href="https://github.com/chriswilson2020/tedit">Repository</a>
+        <a class="button" href="https://github.com/chriswilson2020/tedit/blob/main/README.md">Read the manual</a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>TEDIT 7.0</span>
+    <span>Portable C · curses · UNIX</span>
+    <a href="https://github.com/chriswilson2020/tedit">github.com/chriswilson2020/tedit</a>
+  </footer>
+</body>
+</html>
