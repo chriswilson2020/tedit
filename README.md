@@ -108,9 +108,11 @@ For csh/tcsh:
 
 ### Install into ~/bin
 
-If you already use `~/bin`:
+If you already use `~/bin`, build and install with the same prefix so the
+compiled-in shared syntax path matches the installation location:
 
-    make
+    make clean
+    make PREFIX=$HOME
     make install PREFIX=$HOME
 
 This produces:
@@ -231,14 +233,47 @@ TEDIT detects a project root by looking upward for common markers including
 `.tedit-project`, `.git`, `Makefile`, `GNUmakefile`, `configure` and
 `CMakeLists.txt`.
 
-A project can override the default commands with a file named
-`.tedit-project` in the project root:
+### Smart Build / Run behaviour
+
+**Project -> Build**, **Clean** and **Run** adapt to what you are editing:
+
+1. If a `.tedit-project` exists, TEDIT obeys its explicit commands.
+2. If there is a Makefile or GNUmakefile, Build runs `make` and Clean runs
+   `make clean`. Run is not guessed; add a `run=...` entry to
+   `.tedit-project`.
+3. If there is no project build file and the current file is a standalone C
+   source such as `hello.c`, Build saves it and compiles it as:
+
+       cc -o hello hello.c
+
+   Run then launches:
+
+       ./hello
+
+4. For standalone C++ files (`.cc`, `.cpp`, `.cxx`), TEDIT uses
+   `$CXX` when set. On IRIX it otherwise uses `CC`; on other systems it
+   falls back to `c++`.
+5. Standalone Clean removes the executable generated from the source basename.
+
+A project can override the defaults with a file named `.tedit-project` in
+the project root:
 
     build=make
     clean=make clean
     run=./myprogram
 
-The repository contains `tedit-project.example`.
+The repository itself contains:
+
+    .tedit-project
+
+with:
+
+    build=make
+    clean=make clean
+    run=./tedit
+
+so when developing TEDIT, **Build** runs `make` and **Run** launches
+`./tedit`.
 
 Build/run output is captured inside TEDIT. The output/results browser lets you
 select lines in the conventional `file:line:message` form and press Enter to
