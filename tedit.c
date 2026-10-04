@@ -399,6 +399,7 @@ static int prompt_input(const char *prompt, char *out, int outlen);
 static void path_parent(char *path);
 static int file_browser(char *out, int outlen);
 static int load_file(const char *name);
+static int save_file_as(const char *name);
 static int path_exists(const char *path);
 static int create_new_buffer(void);
 static void scroll_screen(void);
@@ -408,6 +409,7 @@ static void free_capture(UndoCapture *cap);
 static void clear_stack(EditOp *stack, int *count);
 static int confirm_yes_no(const char *message);
 static void compute_bracket_match(void);
+static void run_project_command(const char *cmd, const char *label);
 static int jump_to_output_location(void);
 
 static void set_status(const char *s)
@@ -1400,23 +1402,139 @@ static int ensure_project(void)
     return detect_project_root();
 }
 
-static void run_project_command(const char *cmd, const char *label)
+
+static int project_has_file(const char *name)
+{
+    char path[PATH_LEN];
+
+    if (project_root[0] == '\0')
+        return 0;
+
+    sprintf(path, "%s/%s", project_root, name);
+    return path_exists(path);
+}
+
+static int project_has_makefile(void)
+{
+    return project_has_file("Makefile") || project_has_file("GNUmakefile");
+}
+
+static int project_has_config(void)
+{
+    return project_has_file(".tedit-project");
+}
+
+static int source_kind(const char *name)
+{
+    const char *dot;
+
+    if (name == NULL || name[0] == '\0')
+        return 0;
+
+    dot = strrchr(name, '.');
+    if (dot == NULL)
+        return 0;
+
+    if (!strcmp(dot, ".c"))
+        return 1;
+
+    if (!strcmp(dot, ".cc") ||
+        !strcmp(dot, ".cpp") ||
+        !strcmp(dot, ".cxx"))
+        return 2;
+
+    return 0;
+}
+
+static void standalone_paths(char *dir, char *source, char *exe)
+{
+    char full[PATH_LEN];
+    char cwd[PATH_LEN];
+    char *slash;
+    char *dot;
+
+    full[0] = '\0';
+
+    if (filename[0] == '/') {
+        strncpy(full, filename, sizeof(full) - 1);
+        full[sizeof(full) - 1] = '\0';
+    } else if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        sprintf(full, "%s/%s", cwd, filename);
+    } else {
+        strncpy(full, filename, sizeof(full) - 1);
+        full[sizeof(full) - 1] = '\0';
+    }
+
+    slash = strrchr(full, '/');
+
+    if (slash != NULL) {
+        *slash = '\0';
+        strncpy(dir, full[0] ? full : "/", PATH_LEN - 1);
+        dir[PATH_LEN - 1] = '\0';
+        strncpy(source, slash + 1, NAME_LEN - 1);
+        source[NAME_LEN - 1] = '\0';
+    } else {
+        strcpy(dir, ".");
+        strncpy(source, full, NAME_LEN - 1);
+        source[NAME_LEN - 1] = '\0';
+    }
+
+    strncpy(exe, source, NAME_LEN - 1);
+    exe[NAME_LEN - 1] = '\0';
+
+    dot = strrchr(exe, '.');
+    if (dot != NULL)
+        *dot = '\0';
+}
+
+static void shell_quote(const char *src, char *dst, int dstlen)
+{
+    int si;
+    int di;
+
+    if (dstlen <= 0)
+        return;
+
+    di = 0;
+
+    if (di < dstlen - 1)
+        dst[di++] = '\'';
+
+    for (si = 0; src[si] != '\0' && di < dstlen - 1; si++) {
+        if (src[si] == '\'') {
+            const char *esc;
+            int ei;
+
+            esc = "'\\''";
+
+            for (ei = 0; esc[ei] != '\0' && di < dstlen - 1; ei++)
+                dst[di++] = esc[ei];
+        } else {
+            dst[di++] = src[si];
+        }
+    }
+
+    if (di < dstlen - 1)
+        dst[di++] = '\'';
+
+    dst[di] = '\0';
+}
+
+static int run_command_in_dir(const char *dir, const char *cmd,
+                              const char *label)
 {
     FILE *fp;
-    char shellcmd[PATH_LEN + 512];
+    char shellcmd[PATH_LEN + 1024];
     char line[OUTPUT_LINE];
     char oldcwd[PATH_LEN];
     int status;
 
-    if (!ensure_project())
-        return;
-
     if (getcwd(oldcwd, sizeof(oldcwd)) == NULL)
         oldcwd[0] = '\0';
 
-    if (chdir(project_root) != 0) {
-        set_status("Cannot enter project directory");
-        return;
+    if (dir != NULL && dir[0] != '\0' && chdir(dir) != 0) {
+        set_status("Cannot enter build/run directory");
+        return -1;
     }
 
     sprintf(shellcmd, "%s 2>&1", cmd);
@@ -1427,9 +1545,12 @@ static void run_project_command(const char *cmd, const char *label)
     if (fp == NULL) {
         output_add("Unable to start command.");
         output_visible = 1;
+
         if (oldcwd[0] != '\0')
             chdir(oldcwd);
-        return;
+
+        set_status("Unable to start command");
+        return -1;
     }
 
     sprintf(line, "$ %s", cmd);
@@ -1448,7 +1569,184 @@ static void run_project_command(const char *cmd, const char *label)
     if (oldcwd[0] != '\0')
         chdir(oldcwd);
 
-    sprintf(statusmsg, "%s finished", label);
+    if (status == 0)
+        sprintf(statusmsg, "%s succeeded", label);
+    else
+        sprintf(statusmsg, "%s failed (status %d)", label, status);
+
+    return status;
+}
+
+static int standalone_build(void)
+{
+    char dir[PATH_LEN];
+    char source[NAME_LEN];
+    char exe[NAME_LEN];
+    char qsource[NAME_LEN * 2];
+    char qexe[NAME_LEN * 2];
+    char cmd[NAME_LEN * 4 + 128];
+    const char *compiler;
+    int kind;
+    int status;
+
+    kind = source_kind(filename);
+
+    if (kind == 0)
+        return -1;
+
+    if (modified) {
+        if (save_file_as(filename) != 0) {
+            set_status("Build cancelled: could not save current file");
+            return -1;
+        }
+    }
+
+    standalone_paths(dir, source, exe);
+    shell_quote(source, qsource, sizeof(qsource));
+    shell_quote(exe, qexe, sizeof(qexe));
+
+    if (kind == 1) {
+        compiler = getenv("CC");
+        if (compiler == NULL || compiler[0] == '\0')
+            compiler = "cc";
+    } else {
+        compiler = getenv("CXX");
+        if (compiler == NULL || compiler[0] == '\0') {
+#ifdef __sgi
+            compiler = "CC";
+#else
+            compiler = "c++";
+#endif
+        }
+    }
+
+    sprintf(cmd, "%s -o %s %s", compiler, qexe, qsource);
+    status = run_command_in_dir(dir, cmd, "Build");
+
+    return status;
+}
+
+static int standalone_run(void)
+{
+    char dir[PATH_LEN];
+    char source[NAME_LEN];
+    char exe[NAME_LEN];
+    char qrun[NAME_LEN * 2 + 8];
+    char full[PATH_LEN];
+
+    if (source_kind(filename) == 0)
+        return -1;
+
+    standalone_paths(dir, source, exe);
+    sprintf(full, "%s/%s", dir, exe);
+
+    if (access(full, X_OK) != 0) {
+        set_status("No built executable; use Project -> Build first");
+        return -1;
+    }
+
+    {
+        char runname[NAME_LEN + 3];
+        sprintf(runname, "./%s", exe);
+        shell_quote(runname, qrun, sizeof(qrun));
+    }
+
+    return run_command_in_dir(dir, qrun, "Run");
+}
+
+static void do_smart_build(void)
+{
+    detect_project_root();
+
+    if (project_root[0] != '\0' && project_has_config()) {
+        run_project_command(project_build, "Build");
+        return;
+    }
+
+    if (project_root[0] != '\0' && project_has_makefile()) {
+        run_project_command("make", "Build");
+        return;
+    }
+
+    if (source_kind(filename) != 0) {
+        standalone_build();
+        return;
+    }
+
+    set_status("Nothing to build: no Makefile/.tedit-project or C/C++ source");
+}
+
+static void do_smart_clean(void)
+{
+    char dir[PATH_LEN];
+    char source[NAME_LEN];
+    char exe[NAME_LEN];
+    char full[PATH_LEN];
+
+    detect_project_root();
+
+    if (project_root[0] != '\0' && project_has_config()) {
+        if (project_clean[0] != '\0')
+            run_project_command(project_clean, "Clean");
+        else
+            set_status("No clean command configured");
+        return;
+    }
+
+    if (project_root[0] != '\0' && project_has_makefile()) {
+        run_project_command("make clean", "Clean");
+        return;
+    }
+
+    if (source_kind(filename) != 0) {
+        standalone_paths(dir, source, exe);
+        sprintf(full, "%s/%s", dir, exe);
+
+        if (unlink(full) == 0)
+            set_status("Standalone executable removed");
+        else
+            set_status("No standalone executable to clean");
+
+        return;
+    }
+
+    set_status("Nothing to clean");
+}
+
+static void do_smart_run(void)
+{
+    detect_project_root();
+
+    if (project_root[0] != '\0' && project_has_config()) {
+        if (project_run[0] == '\0')
+            set_status("No run command configured in .tedit-project");
+        else
+            run_project_command(project_run, "Run");
+        return;
+    }
+
+    if (project_root[0] != '\0' && project_has_makefile()) {
+        if (project_run[0] != '\0')
+            run_project_command(project_run, "Run");
+        else
+            set_status("Make project: add run=... to .tedit-project");
+        return;
+    }
+
+    if (source_kind(filename) != 0) {
+        standalone_run();
+        return;
+    }
+
+    set_status("Nothing runnable for current file");
+}
+
+static void run_project_command(const char *cmd, const char *label)
+{
+    if (!ensure_project())
+        return;
+
+    run_command_in_dir(project_root, cmd, label);
 }
 
 static int find_in_tree(const char *dir, const char *needle, int depth)
@@ -5802,14 +6100,9 @@ static void execute_action(int action)
     case ACT_BOOKMARK_NEXT: next_bookmark(); break;
     case ACT_PROJECT_ROOT: detect_project_root(); break;
     case ACT_PROJECT_OPEN: do_project_open(); break;
-    case ACT_BUILD: run_project_command(project_build, "Build"); break;
-    case ACT_CLEAN: run_project_command(project_clean, "Clean"); break;
-    case ACT_RUN:
-        if (project_run[0] == '\0')
-            set_status("No run command configured (.tedit-project: run=...)");
-        else
-            run_project_command(project_run, "Run");
-        break;
+    case ACT_BUILD: do_smart_build(); break;
+    case ACT_CLEAN: do_smart_clean(); break;
+    case ACT_RUN: do_smart_run(); break;
     case ACT_FIND_FILES: do_find_in_files(); break;
     case ACT_NEXT_RESULT: jump_to_output_location(); break;
     case ACT_TOGGLE_OUTPUT:
