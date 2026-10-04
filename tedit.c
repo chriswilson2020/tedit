@@ -1,5 +1,5 @@
 /*
- * tedit v6 - modular curses text/code editor for classic UNIX
+ * TEDIT v7.0.0 - modular curses text/code editor for classic UNIX
  *
  * Build:
  *   cc -o tedit tedit.c syntax.c format.c -lcurses
@@ -5597,7 +5597,7 @@ static void help_screen(void)
 {
     erase();
 
-    mvaddstr(1, 2, "TEDIT v6 - modular curses editor");
+    mvaddstr(1, 2, "TEDIT v7.0 - modular curses editor");
     mvaddstr(3, 2, "^T Menu   ^N New   ^P Prev buffer   ^E Next buffer");
     mvaddstr(4, 2, "^O Open   ^S Save  ^A Save As       ^Q Quit");
     mvaddstr(5, 2, "^F Find   ^H Replace   ^L Goto");
@@ -5617,7 +5617,7 @@ static void about_screen(void)
 {
     erase();
 
-    mvaddstr(2, 4, "TEDIT v7.0-dev stage 10");
+    mvaddstr(2, 4, "TEDIT v7.0.0");
     mvaddstr(4, 4, "Portable curses code editor for classic UNIX.");
     mvaddstr(5, 4, "Designed to compile on IRIX using plain curses.");
     mvaddstr(7, 4, "Press any key.");
