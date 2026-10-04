@@ -1314,7 +1314,7 @@ static void load_project_commands(void)
 
     strcpy(project_build, "make");
     strcpy(project_clean, "make clean");
-    strcpy(project_run, "./a.out");
+    project_run[0] = '\0';
 
     if (project_root[0] == '\0')
         return;
@@ -5804,7 +5804,12 @@ static void execute_action(int action)
     case ACT_PROJECT_OPEN: do_project_open(); break;
     case ACT_BUILD: run_project_command(project_build, "Build"); break;
     case ACT_CLEAN: run_project_command(project_clean, "Clean"); break;
-    case ACT_RUN: run_project_command(project_run, "Run"); break;
+    case ACT_RUN:
+        if (project_run[0] == '\0')
+            set_status("No run command configured (.tedit-project: run=...)");
+        else
+            run_project_command(project_run, "Run");
+        break;
     case ACT_FIND_FILES: do_find_in_files(); break;
     case ACT_NEXT_RESULT: jump_to_output_location(); break;
     case ACT_TOGGLE_OUTPUT:
@@ -6547,7 +6552,7 @@ int main(int argc, char **argv)
     project_root[0] = '\0';
     strcpy(project_build, "make");
     strcpy(project_clean, "make clean");
-    strcpy(project_run, "./a.out");
+    project_run[0] = '\0';
 
     curbuf = 0;
     buffer_count = 1;
